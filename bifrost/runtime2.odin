@@ -12,12 +12,17 @@ RUNQ_SIZE :: 256
 // Field order is load-bearing: the context-switch assembly in asm_amd64.asm
 // reads and writes these by byte offset. On x86_64 every field is 8 bytes:
 //
-//	sp   @ 0   stack pointer
-//	pc   @ 8   program counter (resume address)
+//	sp   @ 0   stack pointer (points at the saved callee-saved-register frame)
+//	pc   @ 8   resume address (informational; the real one travels on the stack)
 //	g    @ 16  the G this buf belongs to
 //	ctxt @ 24  closure context register (unused for now)
 //	lr   @ 32  link register (ARM64 only; kept for shape parity, unused on amd64)
-//	bp   @ 40  frame base pointer
+//	bp   @ 40  frame base pointer (informational)
+//
+// Only `sp` is essential to resume: gogo restores it and pops the callee-saved
+// registers (rbx, rbp, r12-r15) that gosave_switch pushed onto the goroutine's
+// own stack, then `ret`s to the resume address sitting above them. See
+// asm_amd64.asm for the frame layout and why bifrost saves more than Go does.
 //
 // DEVIATION: current Go's gobuf has no `ret` field (it was removed); the
 // stale CLAUDE.md index listed one. bifrost matches current Go.

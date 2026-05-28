@@ -91,25 +91,30 @@
 > translates to NASM syntax. `nasm` must be installed (build tool, not a
 > library dependency).
 
-- [ ] **2.1 Concept lesson: what `gogo` and `mcall` actually do.**
-      No code; the agent writes a short brief covering: callee-saved
-      registers on SysV AMD64, what `rsp`, `rbp`, `rip` mean, why we
-      need a separate scheduling stack (`g0`).
-- [ ] **2.2 Implement `gosave_systemstack_switch`-style save.**
-      A NASM file `asm_amd64.asm` exporting:
-      `gosave(buf: ^Gobuf)` — saves `rsp`, `rbp`, `rip` (return addr)
-      into `buf`. See Go's `asm_amd64.s` `gosave_systemstack_switch`
-      and `gogo`.
-- [ ] **2.3 Implement `gogo(buf: ^Gobuf) -> never`.**
-      Restore `rsp`, `rbp`, jump to `pc`. Mirror `asm_amd64.s` `gogo`.
+- [x] **2.1 Concept: what `gogo` and `mcall` actually do.**
+      Captured as the header doc comment in `asm_amd64.asm` (callee-saved
+      registers on SysV AMD64, the saved-frame layout, why bifrost saves more
+      than Go) instead of a separate brief.
+- [x] **2.2 / 2.3 Context-switch primitives (`asm_amd64.asm`).**
+      NASM file exporting `gogo(to)` (restore + resume, never returns) and
+      `gosave_switch(from, to)` (save current, resume target — a swapcontext).
+      DEVIATION: rather than Go's split `gosave`+`gogo` that save only sp/pc/bp,
+      bifrost pushes the full callee-saved set (rbx, rbp, r12-r15) onto the
+      suspended goroutine's own stack, because Odin goroutine functions are
+      ordinary SysV functions whose callee-saved registers must survive the
+      switch (Go's compiler spills them per ABIInternal; Odin's does not).
+      `setup_context` (asm_amd64.odin) builds a fresh saved frame. Foreign
+      decls + arch guard in `asm_amd64.odin`.
 - [ ] **2.4 Implement `mcall(fn: proc(^G))`.**
-      Switch from current g to `g0`, then call `fn(curg)` on g0's
-      stack. See `proc.go` callers of `mcall` (e.g. `Gosched_m`).
-- [ ] **2.5 Sanity test: ping-pong between two stacks.**
-      Allocate two raw stacks (just `make([]u8, 64*1024)`), build two
-      `gobuf`s pointing at two trivial functions that increment a
-      counter and `gogo` back to the other. Run for N iterations.
-      Acceptance: counters match expected, no segfault.
+      MOVED TO PHASE 4: mcall must save curg into curg.sched, switch to
+      g0's stack, and call fn(curg) there — it needs g0/current_g wiring that
+      only exists once the scheduler is built. See `proc.go` callers of mcall
+      (e.g. `goschedguarded_m`).
+- [x] **2.5 Sanity test: ping-pong between two stacks.**
+      `asm_amd64_test.odin`: two coroutines on two 64 KiB stacks bounce via
+      `gosave_switch`, each incrementing a counter; one returns to the test via
+      `gogo`. Acceptance met: count_a == iters, count_b == iters-1, no segfault.
+      Requires `nasm` to assemble.
 
 ---
 
