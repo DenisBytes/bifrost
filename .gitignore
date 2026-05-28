@@ -1,0 +1,40 @@
+# Build artifacts
+*.bin
+*.exe
+*.o
+*.obj
+*.a
+*.so
+*.dylib
+*.dll
+/bin/
+/build/
+
+# Odin
+*.odin~
+.odincache/
+
+# Editors
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Local environment
+.env
+.env.local
+
+# Claude / AI tooling local files.
+# NOTE: CLAUDE.md and PLAN.md are tracked project docs and are NOT ignored.
+.claude/
+.anthropic/
+AGENTS.md
+GEMINI.md
+*.plan.md
+docs/superpowers/
+docs/ai/
+.aider*

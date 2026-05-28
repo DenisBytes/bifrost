@@ -1,0 +1,51 @@
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  unit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install NASM
+        run: sudo apt-get update && sudo apt-get install -y nasm
+      - name: Set up Odin
+        uses: laytan/setup-odin@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          release: nightly
+      - name: odin version
+        run: odin version
+      - name: make test
+        run: make test
+
+  integration:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install NASM
+        run: sudo apt-get update && sudo apt-get install -y nasm
+      - name: Set up Odin
+        uses: laytan/setup-odin@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          release: nightly
+      - name: make test-integration
+        run: make test-integration
+
+  examples:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install NASM
+        run: sudo apt-get update && sudo apt-get install -y nasm
+      - name: Set up Odin
+        uses: laytan/setup-odin@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          release: nightly
+      - name: Build examples
+        run: make examples
