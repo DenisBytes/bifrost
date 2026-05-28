@@ -94,12 +94,11 @@ G :: struct {
 }
 
 // M is an OS thread of execution. Mirrors Go's m (runtime2.go:616), reduced
-// to the fields the single-M scheduler needs.
+// subset.
 //
-// DEVIATION: Go's m also carries tls[] (the thread-local slot that makes
-// getg() work) and a `park` note for blocking idle threads. bifrost is
-// single-M through Phase 4 and tracks the current goroutine via the global
-// current_g, so those fields arrive in Phase 5 (multi-M) instead.
+// The "current g/m" that Go stores in m.tls live in the package's
+// @(thread_local) tls_g/tls_m instead (see getg/getm). A `park` blocking
+// primitive for idle Ms (Go's `note`) is added alongside newm.
 M :: struct {
 	// g0 is the scheduling goroutine: it owns a dedicated stack on which the
 	// scheduler itself (schedule, gopark, etc.) runs, separate from any user
@@ -183,14 +182,18 @@ m0: M
 @(private)
 g0: G
 
-// current_g is the goroutine currently executing on the (single) M.
-//
-// DEVIATION: Go resolves the current g from a thread-local slot inside the
-// context-switch assembly (getg()). bifrost is single-M through Phase 4, so it
-// tracks the running goroutine in this global, updated by the scheduler around
-// each switch. Phase 5 replaces this with a real per-thread value.
+// tls_g / tls_m are the goroutine and the M currently executing on THIS OS
+// thread. They use real thread-local storage so getg()/getm() resolve
+// per-thread, which is what makes multi-M scheduling possible. Go reads g from
+// a TLS slot inside its context-switch assembly; bifrost keeps the equivalent
+// here, updated by the scheduler (execute/mcall/mstart) around each switch.
 @(private)
-current_g: ^G
+@(thread_local)
+tls_g: ^G
+
+@(private)
+@(thread_local)
+tls_m: ^M
 
 // runtime_init initializes the global scheduler state for `procs` logical
 // processors and wires up m0/g0. It allocates allp and zeroes sched; it does
@@ -218,19 +221,26 @@ runtime_init :: proc(procs: i32, allocator := context.allocator) {
 	g0.m = &m0
 	g0.atomicstatus = .Running
 	allm = &m0
-	current_g = &g0
 
-	// Bind m0 to P0 (single-M acquirep) so go_ can enqueue onto the local run
-	// queue before run() starts the scheduler. The P stays .Idle until run()
-	// marks it .Running; status does not affect runqput.
+	// This OS thread is m0, currently "running" g0 (the scheduler).
+	tls_m = &m0
+	tls_g = &g0
+
+	// Bind m0 to P0 so go_ can enqueue onto the local run queue before run()
+	// starts the scheduler. The P stays .Idle until run() marks it .Running;
+	// status does not affect runqput.
 	m0.p = allp[0]
 	allp[0].m = &m0
 }
 
-// getg returns the goroutine currently executing on this M.
-//
-// DEVIATION: Go's getg() is a compiler intrinsic reading thread-local storage;
-// bifrost returns the global current_g (single-M; see its doc comment).
+// getg returns the goroutine currently executing on this OS thread. Mirrors
+// Go's getg() (a compiler intrinsic reading thread-local storage).
 getg :: proc "contextless" () -> ^G {
-	return current_g
+	return tls_g
+}
+
+// getm returns the M (OS thread abstraction) currently executing. Equivalent
+// to Go's getg().m.
+getm :: proc "contextless" () -> ^M {
+	return tls_m
 }

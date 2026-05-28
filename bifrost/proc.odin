@@ -56,8 +56,8 @@ park_lock: rawptr
 go_ :: proc(fn: proc(arg: rawptr), arg: rawptr = nil) {
 	assert(allp != nil, "bifrost: call runtime_init before go_")
 	gp := newg(fn, arg)
-	// Single-P: enqueue onto P0's local run queue.
-	runqput(allp[0], gp, true)
+	// Enqueue onto the current M's P (allp[0] for the main thread before run).
+	runqput(getm().p, gp, true)
 }
 
 // run starts the scheduler on the calling OS thread and returns when every
@@ -90,7 +90,7 @@ gosched :: proc() {
 // until some other goroutine calls goready on it. Mirrors gopark
 // (proc.go:449).
 gopark :: proc(unlockf: proc "c" (gp: ^G, lock: rawptr) -> bool, lock: rawptr, reason: Wait_Reason) {
-	gp := current_g
+	gp := getg()
 	gp.waitreason = reason
 	park_unlockf = unlockf
 	park_lock = lock
@@ -112,7 +112,7 @@ goready :: proc(gp: ^G) {
 // a new G and stack. Mirrors newproc1 (proc.go:5343).
 @(private)
 newg :: proc(fn: proc(arg: rawptr), arg: rawptr) -> ^G {
-	pp := allp[0]
+	pp := getm().p
 
 	gp := gfget(pp)
 	if gp == nil {
@@ -155,7 +155,7 @@ newg :: proc(fn: proc(arg: rawptr), arg: rawptr) -> ^G {
 @(private)
 goexit_entry :: proc "c" () {
 	context = runtime.default_context()
-	gp := current_g
+	gp := getg()
 	fn := gp.start_fn
 	arg := gp.start_arg
 	fn(arg)
@@ -181,7 +181,7 @@ goexit0 :: proc "c" (gp: ^G) {
 	gp.param = nil
 	gp.waitreason = .None
 	dropg()
-	gfput(allp[0], gp)
+	gfput(getm().p, gp)
 	schedule()
 }
 
@@ -206,7 +206,30 @@ scheduler_start :: proc() {
 		g0_stack = s
 		g0.stack = s
 	}
-	allp[0].status = .Running
+	// Bind the main M to P0 for the duration of the run (idempotent).
+	acquirep(&m0, allp[0])
+}
+
+// acquirep associates P pp with M mp and marks it running, the analogue of
+// installing a P before executing goroutine code. Mirrors acquirep (proc.go).
+@(private)
+acquirep :: proc(mp: ^M, pp: ^P) {
+	mp.p = pp
+	pp.m = mp
+	pp.status = .Running
+}
+
+// releasep detaches the current P from mp, returning it idle. Mirrors releasep
+// (proc.go).
+@(private)
+releasep :: proc(mp: ^M) -> ^P {
+	pp := mp.p
+	mp.p = nil
+	if pp != nil {
+		pp.m = nil
+		pp.status = .Idle
+	}
+	return pp
 }
 
 // schedule_bootstrap is the first thing that runs on g0 when run() hands over
@@ -215,7 +238,7 @@ scheduler_start :: proc() {
 @(private)
 schedule_bootstrap :: proc "c" () {
 	context = runtime.default_context()
-	current_g = &g0
+	tls_g = &g0
 	schedule()
 }
 
@@ -270,10 +293,11 @@ check_dead :: proc() {
 // into it. Never returns. Mirrors execute (proc.go:3337).
 @(private)
 execute :: proc(gp: ^G) {
-	m0.curg = gp
-	gp.m = &m0
+	mp := getm()
+	mp.curg = gp
+	gp.m = mp
 	casgstatus(gp, .Runnable, .Running)
-	current_g = gp
+	tls_g = gp
 	gogo(&gp.sched)
 }
 
@@ -282,7 +306,7 @@ execute :: proc(gp: ^G) {
 // fast path of findRunnable (proc.go).
 @(private)
 findrunnable :: proc() -> ^G {
-	if gp := runqget(m0.p); gp != nil {
+	if gp := runqget(getm().p); gp != nil {
 		return gp
 	}
 	return globrunqget()
@@ -294,11 +318,11 @@ findrunnable :: proc() -> ^G {
 // operands; the stack switch itself is mcall_switch (asm_amd64.asm).
 @(private)
 mcall :: proc(fn: proc "c" (gp: ^G)) {
-	gp := current_g
+	gp := getg()
 	g0p := gp.m.g0
-	current_g = g0p
+	tls_g = g0p
 	mcall_switch(&gp.sched, cast(rawptr)fn, gp, g0p.sched.sp)
-	// Resumed: execute() set current_g back to gp before gogo'ing here.
+	// Resumed: execute() set tls_g back to gp before gogo'ing here.
 }
 
 // gosched_m is the gosched continuation on g0: requeue the yielding goroutine
@@ -318,10 +342,11 @@ gosched_m :: proc "c" (gp: ^G) {
 // in sync matters once goroutines can migrate between Ms in Phase 5.
 @(private)
 dropg :: proc() {
-	if gp := m0.curg; gp != nil {
+	mp := getm()
+	if gp := mp.curg; gp != nil {
 		gp.m = nil
 	}
-	m0.curg = nil
+	mp.curg = nil
 }
 
 // park_m is the gopark continuation on g0: flip _Grunning -> _Gwaiting, run the
@@ -354,7 +379,7 @@ ready :: proc(gp: ^G) {
 		panic("ready: goroutine is not waiting")
 	}
 	casgstatus(gp, .Waiting, .Runnable)
-	runqput(m0.p, gp, true)
+	runqput(getm().p, gp, true)
 }
 
 // live_goroutines counts goroutines that are not dead; used to distinguish "all
@@ -568,7 +593,8 @@ runtime_teardown :: proc() {
 	sched = {}
 	m0 = {}
 	g0 = {}
-	current_g = nil
+	tls_g = nil
+	tls_m = nil
 	park_unlockf = nil
 	park_lock = nil
 }

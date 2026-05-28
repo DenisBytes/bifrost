@@ -26,8 +26,8 @@ test_runtime_init_wires_m0_g0 :: proc(t: ^testing.T) {
 	testing.expect(t, m0.g0 == &g0, "m0.g0 should point at g0")
 	testing.expect(t, g0.m == &m0, "g0.m should point at m0")
 	testing.expect(t, allm == &m0, "allm should head at m0")
-	testing.expect(t, current_g == &g0, "current_g should start as g0")
 	testing.expect(t, getg() == &g0, "getg() should return g0 after init")
+	testing.expect(t, getm() == &m0, "getm() should return m0 after init")
 }
 
 @(test)
