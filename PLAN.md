@@ -144,31 +144,37 @@
 > The simplest scheduler that actually runs goroutines. One OS thread,
 > one P, cooperative scheduling only.
 
-- [ ] **4.1 `casgstatus` and the g status enum.**
-      `_Gidle, _Grunnable, _Grunning, _Gwaiting, _Gdead`. Study
-      `runtime2.go` constants and `proc.go:1219` `casfrom_Gscanstatus`.
-      Implement as atomic CAS.
-- [ ] **4.2 Per-P run queue ops.**
-      `runqput(p, g, next bool)`, `runqget(p) -> g`. Mirror `proc.go`
-      `runqput` / `runqget` *exactly* including the `runnext` slot.
-- [ ] **4.3 Global run queue ops.**
-      `globrunqput`, `globrunqget(p, max)`. See `proc.go` of same name.
-- [ ] **4.4 `schedule()` core loop.**
-      On `g0`: pick a runnable G (runnext → local runq → global runq),
-      `casgstatus _Grunnable -> _Grunning`, `gogo(&g.sched)`. See
-      `proc.go` `schedule` and `execute`.
-- [ ] **4.5 `Gosched()`.**
-      Public API: `mcall(gosched_m)` where `gosched_m` puts curg back
-      on the global runq as `_Grunnable` and calls `schedule`. See
-      `proc.go:393`.
-- [ ] **4.6 `gopark` and `goready`.**
-      `gopark` parks current g (`_Grunning -> _Gwaiting`) with an
-      unlock function; `goready` makes a `_Gwaiting` g `_Grunnable`
-      and `runqput`s it. See `proc.go:449` and `:485`.
-- [ ] **4.7 Public `go_(fn, arg)` entry.**
-      Equivalent of Go's `go fn(arg)`. Calls `newg`, `runqput(p, g, true)`.
-      Acceptance test: spawn 1000 goroutines that each increment a
-      shared counter via `Gosched`-yielding loop; final counter == 1000.
+- [x] **4.1 `casgstatus` and the g status enum.** (`status.odin`, Phase 1)
+      `G_Status{Idle,Runnable,Running,Waiting,Dead}` + atomic-CAS `casgstatus`.
+      DEVIATION: Go spins to tolerate the GC `_Gscan` bit; bifrost has no GC, so
+      a failed CAS is a bug and panics (mirrors Go's throw).
+- [x] **4.2 Per-P run queue ops.** (`proc.odin`)
+      `runqput(p, g, next)` (incl. the runnext slot, gated by `HAVE_SYSMON` like
+      Go's `!haveSysmon` guard), `runqget(p)`, `runqputslow` overflow-to-global.
+      DEVIATION: single-M, so plain loads/stores replace Go's atomic ring ops
+      (atomics return in Phase 5).
+- [x] **4.3 Global run queue ops.** (`proc.odin`)
+      `globrunqput`, `globrunqputbatch`, `globrunqget` over the `G_Queue` FIFO.
+      sched.lock unused until Phase 5 (single-M).
+- [x] **4.4 `schedule()` / `execute()` + `mcall` (2.4).** (`proc.odin`, `asm`)
+      schedule: findrunnable (local→global) → execute → `gogo(&g.sched)`; when
+      idle, deadlock-detect or `gogo(&sched_return)` back to `run()`. mcall lands
+      here (asm `mcall_switch`): save curg, switch to g0, call fn. `run()` /
+      `schedule_bootstrap` boot the loop.
+- [x] **4.5 `gosched()`.** (`proc.odin`)
+      `mcall(gosched_m)`; gosched_m requeues curg `Running->Runnable` on the
+      GLOBAL runq (fair) and calls schedule. Mirrors `proc.go:393`/goschedImpl.
+- [x] **4.6 `gopark` and `goready`.** (`proc.odin`)
+      gopark: `Running->Waiting` via `mcall(park_m)` with an optional unlockf
+      (veto resumes); goready/ready: `Waiting->Runnable` + runqput. Park
+      unlockf/lock held in package globals (Go uses m fields; Phase 5 moves them).
+- [x] **4.7 Public `go_` + `newg`/`goexit` (3.2/3.3).** (`proc.odin`)
+      `go_(fn, arg)` -> newg (reuses dead G+stack from gfree, else allocates) ->
+      runqput. goexit_entry trampoline runs fn then `goexit` -> goexit0 (Dead +
+      gfput + schedule). DEVIATION: fn/arg stored on the G and run via an Odin
+      trampoline instead of Go's gostartcallfn stack encoding. Acceptance:
+      1000-goroutine counter test == 1000; integration stress (10k goroutines,
+      batch reuse) green; spawn/pingpong examples run.
 
 ---
 

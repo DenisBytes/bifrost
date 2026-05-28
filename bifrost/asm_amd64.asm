@@ -26,6 +26,7 @@ bits 64
 
 global gogo
 global gosave_switch
+global mcall_switch
 
 ; Mark the stack as non-executable (avoids an exec-stack linker warning).
 section .note.GNU-stack
@@ -72,3 +73,27 @@ gosave_switch:
 	pop  rbx
 	pop  rbp
 	ret                      ; jump to `to`'s saved resume address
+
+; void mcall_switch(Gobuf *save /*rdi*/, void *fn /*rsi*/, G *gp /*rdx*/, uintptr g0_sp /*rcx*/)
+;
+; The asymmetric scheduler switch (Go's mcall, asm_amd64.s:425). Saves the
+; current goroutine's context into `save` (so a later gogo(save) resumes the
+; goroutine right after the mcall returns), switches rsp to the scheduling
+; stack `g0_sp`, and calls fn(gp) there. fn must not return (it ends by
+; gogo-ing into some goroutine or back to the bootstrap); `ud2` traps if it
+; does. g0_sp must be 16-byte aligned.
+mcall_switch:
+	push rbp
+	push rbx
+	push r12
+	push r13
+	push r14
+	push r15
+	mov  [rdi + 0], rsp      ; save.sp = sp after saving the callee-saved set
+	mov  rax, [rsp + 48]     ; resume address (above the 6 saved registers)
+	mov  [rdi + 8], rax       ; save.pc (informational)
+	mov  [rdi + 40], rbp     ; save.bp (informational)
+	mov  rsp, rcx            ; switch to the g0 scheduling stack
+	mov  rdi, rdx            ; arg0 = gp
+	call rsi                 ; fn(gp) -- must not return
+	ud2

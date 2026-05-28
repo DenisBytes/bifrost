@@ -1,6 +1,6 @@
 PACKAGES = bifrost
 
-EXAMPLES = hello
+EXAMPLES = hello spawn pingpong
 
 BIN = bin
 

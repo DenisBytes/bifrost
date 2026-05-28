@@ -26,6 +26,12 @@ when ODIN_ARCH == .amd64 {
 		// the scheduler's asymmetric mcall is built on the same ideas in
 		// Phase 4.
 		gosave_switch :: proc "c" (from: ^Gobuf, to: ^Gobuf) ---
+
+		// mcall_switch saves the current context into `save`, switches to the
+		// scheduling stack `g0_sp`, and calls fn(gp) there. fn must not return.
+		// The building block of mcall (proc.odin). Mirrors Go's mcall
+		// (asm_amd64.s:425).
+		mcall_switch :: proc "c" (save: ^Gobuf, fn: rawptr, gp: ^G, g0_sp: uintptr) ---
 	}
 
 	// CTX_SAVED_REGS is the number of callee-saved registers gosave_switch

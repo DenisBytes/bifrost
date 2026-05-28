@@ -83,6 +83,14 @@ G :: struct {
 	// param is a scratch pointer used to hand a value to a goroutine as it is
 	// resumed (e.g. the completed sudog of a channel op). Mirrors g.param.
 	param: rawptr,
+	// start_fn / start_arg hold the goroutine's entry function and its single
+	// argument, read by the goexit_entry trampoline on first run.
+	// DEVIATION: Go encodes the start function and arguments on the new
+	// goroutine's stack via gostartcallfn (proc.go newproc1); bifrost stores
+	// them on the G and uses an Odin trampoline instead — simpler given Odin
+	// has no equivalent stack-arg machinery.
+	start_fn:  proc(arg: rawptr),
+	start_arg: rawptr,
 }
 
 // M is an OS thread of execution. Mirrors Go's m (runtime2.go:616), reduced
@@ -211,6 +219,12 @@ runtime_init :: proc(procs: i32, allocator := context.allocator) {
 	g0.atomicstatus = .Running
 	allm = &m0
 	current_g = &g0
+
+	// Bind m0 to P0 (single-M acquirep) so go_ can enqueue onto the local run
+	// queue before run() starts the scheduler. The P stays .Idle until run()
+	// marks it .Running; status does not affect runqput.
+	m0.p = allp[0]
+	allp[0].m = &m0
 }
 
 // getg returns the goroutine currently executing on this M.
