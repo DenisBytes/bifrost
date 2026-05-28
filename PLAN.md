@@ -24,7 +24,7 @@
 - [x] **0.2 Hello-world example skeleton.**
       `examples/hello/` imports the package and prints "ok", proving the
       build pipeline works before any real code lands.
-- [ ] **0.3 Initialise git, write `.gitignore` for Odin builds.**
+- [x] **0.3 Initialise git, write `.gitignore` for Odin builds.**
       First commit: `CLAUDE.md`, `PLAN.md`, skeleton from 0.1/0.2.
 - [x] **0.4 CI pipeline (GitHub Actions) — minimal.**
       `.github/workflows/test.yml` with `unit`, `integration`, and
@@ -48,30 +48,31 @@
 > Goal: have the same *shape* of structs as Go's runtime so every later
 > task is a 1-to-1 translation. No scheduler logic in this phase.
 
-- [ ] **1.1 Define `gobuf`.**
-      Mirror `runtime2.go:303`. Fields: `sp`, `pc`, `g`, `ctxt`, `ret`,
-      `lr` (ARM64 only later), `bp`. Just a struct + zeroing helper.
-- [ ] **1.2 Define `stack`.**
-      Mirror `runtime2.go:460`. `lo`, `hi` (uintptrs). Add a
-      `stack_alloc(size)` / `stack_free(s)` stub that `panic`s for now.
-- [ ] **1.3 Define `g`.**
-      Mirror `runtime2.go:471`. Start with the *minimal viable subset*:
-      `stack`, `sched gobuf`, `atomicstatus`, `goid`, `m`, `schedlink`,
-      `waitreason`, `param`. Skip GC/profiling fields.
-- [ ] **1.4 Define `m`.**
-      Mirror `runtime2.go:616`. Subset: `g0` (the scheduling g),
-      `curg` (the user g currently running), `p` (current P),
-      `nextp`, `id`, `tls`/thread-local pointer, `park` semaphore.
-- [ ] **1.5 Define `p`.**
-      Mirror `runtime2.go:774`. Subset: `id`, `status`, `m`, `runqhead`,
-      `runqtail`, `runq[256]*g`, `runnext`, `gFree` list.
-- [ ] **1.6 Define `schedt`.**
-      Mirror `runtime2.go:932`. Subset: `goidgen` (atomic), global
-      runq head/tail/size, idle M list, idle P list, lock.
-- [ ] **1.7 Globals.**
-      `allgs []*g`, `allm *m`, `allp []*p`, `sched schedt`, `gomaxprocs`.
-      Provide a `runtime_init(gomaxprocs)` that allocates `allp` and
-      zeroes `sched`. No threads yet.
+- [x] **1.1 Define `gobuf`.** (`Gobuf` in `runtime2.odin`)
+      Mirror `runtime2.go:303`. Fields `sp, pc, g, ctxt, lr, bp`.
+      DEVIATION: current Go has no `ret` field, so bifrost omits it. Field
+      offsets (sp@0, pc@8, bp@40) are guarded by a test for the Phase 2 asm.
+- [x] **1.2 Define `stack`.** (`Stack` in `runtime2.odin`)
+      Mirror `runtime2.go:460`. `lo`, `hi`. The `stack_alloc`/`stack_free`
+      allocator lands in Phase 3 rather than as a panicking stub here.
+- [x] **1.3 Define `g`.** (`G` in `runtime2.odin`)
+      Mirror `runtime2.go:471`. Minimal subset: `stack`, `sched`,
+      `atomicstatus`, `goid`, `m`, `schedlink`, `waitreason`, `param`.
+- [x] **1.4 Define `m`.** (`M` in `runtime2.odin`)
+      Mirror `runtime2.go:616`. Subset: `g0`, `curg`, `p`, `nextp`, `id`,
+      `alllink`. DEVIATION: `tls` and the `park` note are deferred to Phase 5
+      (multi-M); single-M tracks the current g via the global `current_g`.
+- [x] **1.5 Define `p`.** (`P` in `runtime2.odin`)
+      Mirror `runtime2.go:774`. Subset: `id`, `status` (`P_Status`), `m`,
+      `runqhead`, `runqtail`, `runq[256]`, `runnext`, `gfree` (`G_List`).
+- [x] **1.6 Define `schedt`.** (`Schedt` in `runtime2.odin`)
+      Mirror `runtime2.go:932`. Subset: `goidgen`, global runq (`G_Queue`
+      head/tail/n), idle M list, idle P list, `lock`.
+- [x] **1.7 Globals.** (`runtime2.odin`)
+      `allgs`, `allm`, `allp`, `sched`, `gomaxprocs`, plus `m0`/`g0`/
+      `current_g`. `runtime_init(procs)` allocates `allp`, zeroes `sched`,
+      and wires m0/g0. `G_Status`/`P_Status`/`Wait_Reason` + `casgstatus`
+      live in `status.odin`. No threads yet.
 
 ---
 

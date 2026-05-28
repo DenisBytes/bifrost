@@ -112,6 +112,9 @@ Naming mirrors the user's Odin style (see `/home/denisbytes/dev/kafka-odin`):
 ## Testing approach
 - **Unit tests** are colocated as `*_test.odin` in the `bifrost` package,
   one test file per source file. Use `testing.expect` / `testing.expectf`.
+- Tests run **serially** (`-define:ODIN_TEST_THREADS=1`, set in the Makefile):
+  the runtime is global state (`allp`, `sched`, `m0`, `g0`), so tests that boot
+  it cannot run concurrently. A per-test fresh runtime is Phase 13.2 work.
 - **Integration/stress tests** live in `integration_*_test.odin` in the same
   package; each begins with `if integration_skip(t) do return` so the unit
   suite is unaffected unless `BIFROST_INTEGRATION=1`.

@@ -19,19 +19,26 @@ check:
 		odin check $$pkg -vet -strict-style -no-entry-point || exit 1; \
 	done
 
-# test runs the colocated unit tests. Integration/stress tests early-return
-# unless BIFROST_INTEGRATION=1 (see test-integration).
+# test runs the colocated unit tests.
+#
+# ODIN_TEST_THREADS=1 forces serial execution: bifrost's runtime is a set of
+# global singletons (allp, sched, m0, g0, current_g), so tests that boot it
+# cannot run concurrently against shared state. A per-test fresh runtime is
+# planned for Phase 13.2; until then, serial is correct.
+#
+# Integration/stress tests early-return unless BIFROST_INTEGRATION=1 (see
+# test-integration).
 test:
 	@for pkg in $(PACKAGES); do \
 		echo "==> odin test $$pkg"; \
-		odin test $$pkg || exit 1; \
+		odin test $$pkg -define:ODIN_TEST_THREADS=1 || exit 1; \
 	done
 
 # test-integration runs the heavier env-gated scheduler stress tests.
 test-integration:
 	@for pkg in $(PACKAGES); do \
 		echo "==> odin test $$pkg (integration)"; \
-		BIFROST_INTEGRATION=1 odin test $$pkg || exit 1; \
+		BIFROST_INTEGRATION=1 odin test $$pkg -define:ODIN_TEST_THREADS=1 || exit 1; \
 	done
 
 # examples compiles every example program into ./bin.
