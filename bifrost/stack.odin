@@ -12,9 +12,10 @@ PAGE_SIZE :: 4096
 // DEVIATION: Go's _StackMin is 8 KiB and Go grows stacks on demand via
 // compiler-inserted morestack checks (stack.go). bifrost has no morestack — the
 // Odin compiler inserts no stack-growth prologue — so a goroutine's entire call
-// tree must fit in this fixed allocation. bifrost therefore starts larger
-// (16 KiB) and never grows. See PLAN 3.4.
-STACK_MIN :: 16 * 1024
+// tree (including any fmt/reflection it calls) must fit in this fixed
+// allocation, and overflow faults on the guard page rather than growing.
+// bifrost therefore uses a generous fixed 32 KiB. See PLAN 3.4.
+STACK_MIN :: 32 * 1024
 
 // Stack_Error reports why a goroutine stack could not be allocated.
 Stack_Error :: enum {

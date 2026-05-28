@@ -2,21 +2,14 @@ package bifrost
 
 import "core:testing"
 
-// free_runtime releases what runtime_init allocated so each test starts from
-// a clean slate (a stand-in for the Phase 13 teardown helper).
-@(private)
-free_runtime :: proc() {
-	for pp in allp {
-		free(pp)
-	}
-	delete(allp)
-	allp = nil
-}
+// These tests use runtime_teardown (proc.odin) to reset global runtime state
+// between runs; it safely no-ops the pieces these init-only tests never
+// allocate (allgs, g0_stack).
 
 @(test)
 test_runtime_init_single_p :: proc(t: ^testing.T) {
 	runtime_init(1)
-	defer free_runtime()
+	defer runtime_teardown()
 
 	testing.expectf(t, gomaxprocs == 1, "gomaxprocs = %d, want 1", gomaxprocs)
 	testing.expectf(t, len(allp) == 1, "len(allp) = %d, want 1", len(allp))
@@ -28,7 +21,7 @@ test_runtime_init_single_p :: proc(t: ^testing.T) {
 @(test)
 test_runtime_init_wires_m0_g0 :: proc(t: ^testing.T) {
 	runtime_init(1)
-	defer free_runtime()
+	defer runtime_teardown()
 
 	testing.expect(t, m0.g0 == &g0, "m0.g0 should point at g0")
 	testing.expect(t, g0.m == &m0, "g0.m should point at m0")
@@ -40,7 +33,7 @@ test_runtime_init_wires_m0_g0 :: proc(t: ^testing.T) {
 @(test)
 test_runtime_init_multiple_ps :: proc(t: ^testing.T) {
 	runtime_init(4)
-	defer free_runtime()
+	defer runtime_teardown()
 
 	testing.expectf(t, len(allp) == 4, "len(allp) = %d, want 4", len(allp))
 	for pp, i in allp {

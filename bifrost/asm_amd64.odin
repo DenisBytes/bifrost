@@ -23,8 +23,8 @@ when ODIN_ARCH == .amd64 {
 		// gosave_switch saves the current context into `from` and resumes `to`.
 		// It returns (normally) when some later switch resumes `from`. The
 		// symmetric "yield to a specific context" primitive (a swapcontext);
-		// the scheduler's asymmetric mcall is built on the same ideas in
-		// Phase 4.
+		// the scheduler's asymmetric switch is mcall_switch (below), built on
+		// the same ideas.
 		gosave_switch :: proc "c" (from: ^Gobuf, to: ^Gobuf) ---
 
 		// mcall_switch saves the current context into `save`, switches to the

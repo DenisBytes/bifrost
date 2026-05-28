@@ -53,7 +53,7 @@ gogo:
 ; Saves the current execution context into `from`, then resumes `to`. From the
 ; caller's point of view this returns (normally) once some later switch resumes
 ; `from`. This is the symmetric "yield to a specific context" primitive (a
-; swapcontext); the scheduler's asymmetric mcall is built separately in Phase 4.
+; swapcontext); the scheduler's asymmetric switch is mcall_switch (below).
 gosave_switch:
 	push rbp
 	push rbx

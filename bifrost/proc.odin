@@ -2,6 +2,7 @@ package bifrost
 
 import "base:intrinsics"
 import "base:runtime"
+import "core:fmt"
 
 // Phase 4: a single-M, single-P cooperative scheduler. One OS thread (m0) runs
 // goroutines on its P (allp[0]); goroutines yield voluntarily via gosched, park
@@ -53,6 +54,7 @@ park_lock: rawptr
 // run until the scheduler (run) is active and reaches it. Mirrors newproc
 // (proc.go).
 go_ :: proc(fn: proc(arg: rawptr), arg: rawptr = nil) {
+	assert(allp != nil, "bifrost: call runtime_init before go_")
 	gp := newg(fn, arg)
 	// Single-P: enqueue onto P0's local run queue.
 	runqput(allp[0], gp, true)
@@ -63,6 +65,7 @@ go_ :: proc(fn: proc(arg: rawptr), arg: rawptr = nil) {
 // then run. Equivalent to the role Go's main thread plays after the runtime
 // boots.
 run :: proc() {
+	assert(allp != nil, "bifrost: call runtime_init before run")
 	scheduler_start()
 
 	// Save the OS thread context and jump onto g0 to run schedule(). The
@@ -70,6 +73,7 @@ run :: proc() {
 	// remain runnable.
 	g0_bytes := (cast([^]u8)g0_stack.lo)[:int(g0_stack.hi - g0_stack.lo)]
 	setup_context(&g0.sched, cast(rawptr)schedule_bootstrap, g0_bytes)
+	g0.sched.g = &g0 // parity with newg; bifrost's asm never reads gobuf.g today
 	gosave_switch(&sched_return, &g0.sched)
 }
 
@@ -139,6 +143,12 @@ newg :: proc(fn: proc(arg: rawptr), arg: rawptr) -> ^G {
 // then exits. Entered via gogo, so it has no incoming context — hence "c" and
 // the explicit context setup, mirroring how core:thread bootstraps a thread.
 //
+// PHASE-5 CAVEAT: runtime.default_context() hands every goroutine the SAME
+// process-global temp allocator and heap allocator. That is safe under the
+// single-M cooperative scheduler (no two goroutines run at once), but the
+// global temp allocator is not thread-safe — Phase 5 (multi-M) must give each
+// goroutine its own context/temp allocator and restore it on resume.
+//
 // DEVIATION: Go threads the equivalent of this trampoline through goexit as the
 // new goroutine's return address (proc.go newproc1 + asm goexit); bifrost uses
 // a plain Odin entry that reads start_fn/start_arg off the G.
@@ -170,8 +180,7 @@ goexit0 :: proc "c" (gp: ^G) {
 	gp.start_arg = nil
 	gp.param = nil
 	gp.waitreason = .None
-	gp.m = nil
-	m0.curg = nil // dropg
+	dropg()
 	gfput(allp[0], gp)
 	schedule()
 }
@@ -180,18 +189,23 @@ goexit0 :: proc "c" (gp: ^G) {
 // Scheduler core (runs on g0)
 // ---------------------------------------------------------------------------
 
-// scheduler_start allocates the g0 scheduling stack and marks P0 running. Call
-// once, from run.
+// scheduler_start allocates the g0 scheduling stack (once) and marks P0
+// running. Called from every run(); the g0 stack is allocated only on the
+// first call and reused thereafter, so repeated run()/idle cycles within one
+// runtime_init don't leak mmap regions (matches Go: the g0 stack lives for the
+// M's lifetime, not per scheduler entry).
 @(private)
 scheduler_start :: proc() {
-	// A roomier stack for the scheduler than a normal goroutine: schedule ->
-	// execute and the continuations run here.
-	s, err := stack_alloc(STACK_MIN * 4)
-	if err != .None {
-		panic("scheduler_start: g0 stack allocation failed")
+	if g0_stack.lo == 0 {
+		// A roomier stack for the scheduler than a normal goroutine: schedule
+		// -> execute and the continuations run here.
+		s, err := stack_alloc(STACK_MIN * 4)
+		if err != .None {
+			panic("scheduler_start: g0 stack allocation failed")
+		}
+		g0_stack = s
+		g0.stack = s
 	}
-	g0_stack = s
-	g0.stack = s
 	allp[0].status = .Running
 }
 
@@ -213,12 +227,43 @@ schedule_bootstrap :: proc "c" () {
 schedule :: proc() {
 	gp := findrunnable()
 	if gp == nil {
-		if live_goroutines() > 0 {
-			panic("all goroutines are asleep - deadlock!")
-		}
+		check_dead() // panics on deadlock / lost wakeup; returns only if all dead
 		gogo(&sched_return) // no work left: return to run()'s caller
+		return // unreachable: gogo does not return, but the compiler can't know
 	}
 	execute(gp)
+}
+
+// check_dead inspects every goroutine when the run queues have drained, to tell
+// apart three terminal situations. A goroutine left _Grunnable/_Grunning while
+// the scheduler is idle is a lost-wakeup invariant violation (a bug). If the
+// only survivors are _Gwaiting, the program is genuinely deadlocked — report
+// each parked goroutine's id and wait reason. If everything is dead, return so
+// the caller hands control back to the OS thread. Mirrors Go's checkdead
+// (proc.go).
+@(private)
+check_dead :: proc() {
+	runnable := 0
+	waiting := 0
+	for gp in allgs {
+		#partial switch g_status(gp) {
+		case .Runnable, .Running:
+			runnable += 1
+		case .Waiting:
+			waiting += 1
+		}
+	}
+	if runnable > 0 {
+		fmt.panicf("checkdead: %d runnable goroutine(s) but the scheduler is idle (lost wakeup)", runnable)
+	}
+	if waiting > 0 {
+		for gp in allgs {
+			if g_status(gp) == .Waiting {
+				fmt.eprintfln("  goroutine %d: waiting (%v)", gp.goid, gp.waitreason)
+			}
+		}
+		panic("all goroutines are asleep - deadlock!")
+	}
 }
 
 // execute runs gp: bind it to the M, flip _Grunnable -> _Grunning, and gogo
@@ -263,9 +308,20 @@ mcall :: proc(fn: proc "c" (gp: ^G)) {
 gosched_m :: proc "c" (gp: ^G) {
 	context = runtime.default_context()
 	casgstatus(gp, .Running, .Runnable)
-	m0.curg = nil // dropg
+	dropg()
 	globrunqput(gp)
 	schedule()
+}
+
+// dropg severs the current goroutine from its M, clearing both directions of
+// the link (gp.m and m.curg). Mirrors dropg (proc.go:4246); keeping both sides
+// in sync matters once goroutines can migrate between Ms in Phase 5.
+@(private)
+dropg :: proc() {
+	if gp := m0.curg; gp != nil {
+		gp.m = nil
+	}
+	m0.curg = nil
 }
 
 // park_m is the gopark continuation on g0: flip _Grunning -> _Gwaiting, run the
@@ -275,7 +331,7 @@ gosched_m :: proc "c" (gp: ^G) {
 park_m :: proc "c" (gp: ^G) {
 	context = runtime.default_context()
 	casgstatus(gp, .Running, .Waiting)
-	m0.curg = nil // dropg
+	dropg()
 
 	if park_unlockf != nil {
 		ok := park_unlockf(gp, park_lock)
@@ -314,9 +370,11 @@ live_goroutines :: proc() -> int {
 	return n
 }
 
-// next_goid returns a fresh, monotonically increasing goroutine id (the main
-// goroutine in Go is 1, so bifrost's first is 1 too). Mirrors goidgen usage in
-// newproc1.
+// next_goid returns a fresh, monotonically increasing goroutine id. The first
+// id is 1 (Go's main goroutine is 1 too): intrinsics.atomic_add is fetch-then-
+// add (it returns the value BEFORE adding — base/intrinsics "fetch then
+// operator"), so the first call returns 0 and +1 yields 1. Mirrors goidgen
+// usage in newproc1.
 @(private)
 next_goid :: proc() -> u64 {
 	return intrinsics.atomic_add(&sched.goidgen, 1) + 1
@@ -366,6 +424,9 @@ runqput :: proc(pp: ^P, gp: ^G, next: bool) {
 // runqputslow (proc.go:7554).
 @(private)
 runqputslow :: proc(pp: ^P, gp: ^G, h, t: u32) {
+	// Only ever called from runqput when the local queue is full; the batch
+	// math assumes exactly that. Mirrors Go's "queue is not full" throw.
+	assert(t - h == RUNQ_SIZE, "runqputslow: local run queue is not full")
 	n := (t - h) / 2
 
 	head: ^G
