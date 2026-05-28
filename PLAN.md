@@ -120,23 +120,22 @@
 
 ## Phase 3 — Stack management (start fixed-size)
 
-- [ ] **3.1 Fixed-size stack allocator.**
-      8 KiB or 16 KiB per goroutine, page-aligned, with a guard page
-      (`mmap` + `mprotect PROT_NONE` on the low page). See `stack.go`
-      `stackalloc` for the *idea*; we are NOT implementing the
-      stack cache spans yet.
-- [ ] **3.2 `newg(fn, arg)`.**
-      Allocate a `g`, allocate a stack, set up `gobuf` so that on
-      first `gogo` it begins executing a trampoline `goexit0(fn, arg)`.
-      See `proc.go` `newproc`, `newproc1`.
-- [ ] **3.3 `goexit` trampoline.**
-      A function that `mcall`s into `goexit0`, which marks the g dead
-      and returns it to the per-P `gFree` list. See `proc.go` `goexit`,
-      `goexit1`, `goexit0`.
-- [ ] **3.4 (Deferred / optional) Growable stacks.**
-      Real Go uses split stacks via compiler-inserted `morestack`
-      checks. Odin's compiler does NOT do this. Document the
-      limitation; revisit only after the rest of the runtime works.
+- [x] **3.1 Fixed-size stack allocator.** (`stack.odin`)
+      `stack_alloc(size)`/`stack_free` via `core:sys/linux` mmap + a low-end
+      PROT_NONE guard page; 16 KiB default (`STACK_MIN`). No span cache. Tests
+      cover bounds, alignment, writability, and zero-Stack free.
+- [ ] **3.2 `newg(fn, arg)`** — MOVED TO PHASE 4. newg allocates a G + stack
+      and uses `setup_context` so the first `gogo` runs a trampoline that calls
+      fn then exits. It is only exercisable once the scheduler exists, so it
+      lands with go_/execute in Phase 4. See `proc.go` `newproc`, `newproc1`.
+- [ ] **3.3 `goexit` trampoline** — MOVED TO PHASE 4. After the user fn
+      returns, the trampoline marks the G `Dead`, returns it to the per-P
+      gfree list, and re-enters the scheduler. Needs mcall/schedule, so it is
+      built in Phase 4. See `proc.go` `goexit`, `goexit0`.
+- [x] **3.4 Growable stacks — documented as out of scope.**
+      Go grows stacks via compiler-inserted `morestack`; Odin's compiler does
+      not, so bifrost uses fixed stacks (see `STACK_MIN` doc comment). Recorded
+      as a permanent deviation; not revisited in this milestone.
 
 ---
 
