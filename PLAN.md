@@ -331,11 +331,12 @@
       `chan_send(ch, v)`, `chan_recv(ch) -> (T, bool)`, `chan_close(ch)` — thin
       parametric-polymorphism wrappers that `size_of(T)` into the untyped core
       and copy via `&v`. Tested typed unbuffered send/recv and buffered+close.
-- [ ] **6.7 Acceptance: worker pool + unbuffered ping-pong.**
-      Producer pushes 10k ints into a buffered chan (cap 16); N consumer
-      goroutines drain; sum matches expected. Plus an unbuffered ping-pong
-      proving synchronous handoff. Multi-M (`runtime_init(4)`) integration
-      stress, looped, leak-clean. `examples/` gets a `chan` worker-pool demo.
+- [x] **6.7 Acceptance: worker pool + unbuffered ping-pong.**
+      `integration_chan_test.odin` on 4 OS threads: a buffered worker pool
+      (1 producer streams 10k ints, closes; 4 consumers drain — exact count and
+      sum) and an unbuffered ping-pong (1000 cross-M synchronous rounds), both
+      leak-clean and looped. `examples/chan` is a worker-pool demo (sum of
+      squares across 4 threads).
 
 ---
 
