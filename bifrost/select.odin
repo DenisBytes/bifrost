@@ -89,23 +89,26 @@ selparkcommit :: proc "c" (gp: ^G, lock: rawptr) -> bool {
 dequeue_sudog :: proc(q: ^Waitq, sgp: ^Sudog) {
 	x := sgp.prev
 	y := sgp.next
+	defer {
+		// Defensively clear both links on every return: the acquire_sudog
+		// symmetric asserts now require it by construction, not by case-position
+		// invariant (e.g. the already-removed case used to leave both untouched).
+		sgp.next = nil
+		sgp.prev = nil
+	}
 	if x != nil {
 		if y != nil {
 			x.next = y
 			y.prev = x
-			sgp.next = nil
-			sgp.prev = nil
 			return
 		}
 		x.next = nil
 		q.last = x
-		sgp.prev = nil
 		return
 	}
 	if y != nil {
 		y.prev = nil
 		q.first = y
-		sgp.next = nil
 		return
 	}
 	// x == y == nil: sgp is either the only element or was already removed.

@@ -1111,6 +1111,34 @@ sudog_pool_free :: proc() {
 // some pieces were never allocated.
 @(private)
 runtime_teardown :: proc() {
+	// Drain check FIRST, while Gs and Sudogs are still live so the diagnostic can
+	// name the stranded goroutine. A leaked sema_acquire would otherwise leave a
+	// Sudog in some bucket's head/tail — sudog_pool_free walks per-P caches +
+	// central list, NOT sema_table — and the later `sema_table = {}` would
+	// orphan it silently. Panic loudly with addr/goid so the bug points at the
+	// unreleased acquirer, not at a phantom allocator leak.
+	for &root, i in sema_table {
+		for s := root.head; s != nil; s = s.waitlink {
+			goid: u64
+			reason := Wait_Reason.None
+			if s.g != nil {
+				goid = s.g.goid
+				reason = s.g.waitreason
+			}
+			fmt.eprintfln(
+				"  sema leak: bucket=%d addr=%p goid=%d reason=%v",
+				i,
+				s.elem,
+				goid,
+				reason,
+			)
+		}
+		if root.head != nil || root.tail != nil || root.nwait != 0 {
+			panic("runtime_teardown: sema_table not drained (leaked sema_acquire)")
+		}
+	}
+	sema_table = {}
+
 	// Worker Ms: their OS threads were already joined + destroyed by run(); free
 	// each M's g0 stack, g0, and the M itself.
 	for mp in allms {
@@ -1145,15 +1173,4 @@ runtime_teardown :: proc() {
 	g0 = {}
 	tls_g = nil
 	tls_m = nil
-	// A leaked sema_acquire would leave a Sudog in some bucket's head/tail:
-	// sudog_pool_free walks per-P caches + central list, NOT sema_table, so the
-	// dangling Sudog would otherwise leak silently and a future `sema_table = {}`
-	// would orphan its allocation. Panic loudly so the bug points at the right
-	// place (unreleased acquirer), not at a phantom allocator leak.
-	for &root in sema_table {
-		if root.head != nil || root.tail != nil || root.nwait != 0 {
-			panic("runtime_teardown: sema_table not drained (leaked sema_acquire)")
-		}
-	}
-	sema_table = {}
 }

@@ -84,8 +84,12 @@ waitq_dequeue :: proc(q: ^Waitq) -> ^Sudog {
 		} else {
 			y.prev = nil
 			q.first = y
-			sgp.next = nil // mark as removed
 		}
+		// Defensively clear both link fields on the dequeued sudog so the
+		// acquire_sudog symmetric asserts hold by construction, not by head/tail
+		// position invariant.
+		sgp.next = nil
+		sgp.prev = nil
 		if sgp.isSelect {
 			_, won := intrinsics.atomic_compare_exchange_strong(&sgp.g.select_done, u32(0), u32(1))
 			if !won {
