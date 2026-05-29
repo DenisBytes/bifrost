@@ -86,3 +86,40 @@ test_waitq_empty_dequeue :: proc(t: ^testing.T) {
 	q: Waitq
 	testing.expect(t, waitq_dequeue(&q) == nil, "empty waitq should dequeue nil")
 }
+
+// make_chan / destroy_chan / close_chan operate purely on the channel and the
+// caller's allocator, so they need no running scheduler.
+
+@(test)
+test_make_chan_unbuffered :: proc(t: ^testing.T) {
+	c := make_chan(size_of(int), 0)
+	defer destroy_chan(c)
+
+	testing.expect(t, c != nil, "make_chan returned nil")
+	testing.expectf(t, c.dataqsiz == 0, "dataqsiz = %d, want 0", c.dataqsiz)
+	testing.expect(t, c.buf == nil, "unbuffered channel should have nil buf")
+	testing.expectf(t, c.elem_size == size_of(int), "elem_size = %d, want %d", c.elem_size, size_of(int))
+	testing.expectf(t, c.qcount == 0, "qcount = %d, want 0", c.qcount)
+	testing.expectf(t, c.closed == 0, "closed = %d, want 0", c.closed)
+}
+
+@(test)
+test_make_chan_buffered :: proc(t: ^testing.T) {
+	c := make_chan(size_of(int), 4)
+	defer destroy_chan(c)
+
+	testing.expectf(t, c.dataqsiz == 4, "dataqsiz = %d, want 4", c.dataqsiz)
+	testing.expect(t, c.buf != nil, "buffered channel should have a non-nil buf")
+	// The buffer lives immediately after the header in the same allocation.
+	want_buf := rawptr(uintptr(c) + uintptr(size_of(Hchan)))
+	testing.expect(t, c.buf == want_buf, "buf should point just past the header")
+}
+
+@(test)
+test_close_chan_sets_flag :: proc(t: ^testing.T) {
+	c := make_chan(size_of(int), 0)
+	defer destroy_chan(c)
+
+	close_chan(c)
+	testing.expect(t, c.closed != 0, "close_chan did not set the closed flag")
+}

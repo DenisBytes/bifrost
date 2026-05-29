@@ -296,10 +296,12 @@
       `Hchan` struct also landed here (it is type-coupled to `Sudog.c`/`Waitq`);
       `dequeue`'s select wake-race skip is deferred to Phase 7. `sudog_pool_free`
       reclaims pooled sudogs at teardown (bifrost has no GC).
-- [ ] **6.2 `make_chan(elem_size, capacity)` + `close_chan`.**
-      The `Hchan` struct already exists (6.1). Add `make_chan`, allocating the
-      ring buffer inline after the header like `chan.go` `makechan`, and the
-      `close_chan` shell. Mirrors `chan.go`.
+- [x] **6.2 `make_chan(elem_size, capacity)` + `close_chan`.**
+      The `Hchan` struct already exists (6.1). `make_chan` allocates the header +
+      ring buffer in one block (buf points past the header, like `chan.go`
+      `makechan`); `destroy_chan` frees it (no GC). `close_chan` is a shell: it
+      sets the closed flag under the lock and rejects nil/double close — waking
+      queued senders/receivers is 6.5 (nothing is queued until 6.3/6.4).
 - [ ] **6.3 Unbuffered send/recv (synchronous handoff).**
       `chansend(c, elem, block)` / `chanrecv(c, elem, block)`: if a peer
       waits, `send`/`recv` copies the element straight across the parked
