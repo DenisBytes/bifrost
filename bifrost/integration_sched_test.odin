@@ -114,6 +114,45 @@ test_integration_parallel_counter :: proc(t: ^testing.T) {
 	testing.expectf(t, ms >= 2, "only %d M(s) ran goroutines; expected parallel execution", ms)
 }
 
+// Work stealing: a single goroutine spawns children onto its own P's local
+// queue (under 256, so they never overflow to the global queue). Other Ms can
+// only run them by stealing, so seeing >1 M execute children proves stealing.
+@(private = "file")
+steal_seen: u64
+
+@(private = "file")
+steal_counter: i64
+
+@(private = "file")
+steal_child :: proc(arg: rawptr) {
+	intrinsics.atomic_add(&steal_counter, 1)
+	intrinsics.atomic_or(&steal_seen, u64(1) << u64(getm().id))
+}
+
+@(private = "file")
+steal_spawner :: proc(arg: rawptr) {
+	for _ in 0 ..< 200 {
+		go_(steal_child)
+	}
+}
+
+@(test)
+test_integration_work_stealing :: proc(t: ^testing.T) {
+	if integration_skip(t) do return
+
+	runtime_init(4)
+	defer runtime_teardown()
+
+	steal_seen = 0
+	steal_counter = 0
+	go_(steal_spawner)
+	run()
+
+	testing.expectf(t, steal_counter == 200, "children = %d, want 200", steal_counter)
+	ms := popcount(steal_seen)
+	testing.expectf(t, ms >= 2, "children ran on only %d M(s); work stealing should spread them", ms)
+}
+
 // Repeated init/spawn/run/teardown cycles on multiple threads must stay
 // leak-clean and not deadlock (exercises thread create/join each round).
 @(test)

@@ -127,16 +127,20 @@ goready :: proc(gp: ^G) {
 newg :: proc(fn: proc(arg: rawptr), arg: rawptr) -> ^G {
 	pp := getm().p
 
-	gp := gfget(pp)
+	gp := gfget(pp) // per-P reuse: lock-free common path
 	if gp == nil {
+		// Grow path. Serialize under allgs_lock so concurrent newg from
+		// different Ms is safe even if runtime_allocator is not thread-safe (the
+		// test tracking allocator isn't), and so the allgs append is safe.
+		sync.lock(&allgs_lock)
 		gp = new(G, runtime_allocator)
 		s, err := stack_alloc()
 		if err != .None {
+			sync.unlock(&allgs_lock)
 			panic("newg: stack allocation failed")
 		}
 		gp.stack = s
 		casgstatus(gp, .Idle, .Dead) // a zero G reads as _Gidle
-		sync.lock(&allgs_lock)
 		append(&allgs, gp)
 		sync.unlock(&allgs_lock)
 	}
@@ -400,6 +404,9 @@ findrunnable :: proc() -> ^G {
 		if gp := globrunqget(); gp != nil {
 			return gp
 		}
+		if gp := steal_work(mp); gp != nil {
+			return gp
+		}
 		if intrinsics.atomic_load_explicit(&sched.shutdown, .Acquire) {
 			return nil
 		}
@@ -408,6 +415,51 @@ findrunnable :: proc() -> ^G {
 			return nil
 		}
 	}
+}
+
+// steal_work tries to take half of another P's local run queue into mp's P,
+// returning one stolen goroutine (or nil). It scans the Ps from a random start
+// for a few rounds. Mirrors stealWork (proc.go:3834), simplified (no netpoll,
+// no spinning accounting). mp's own queue is empty here (findrunnable checked).
+@(private)
+steal_work :: proc(mp: ^M) -> ^G {
+	if gomaxprocs <= 1 {
+		return nil
+	}
+	pp := mp.p
+	for _ in 0 ..< 4 {
+		start := fastrand() % u32(gomaxprocs)
+		for i in 0 ..< gomaxprocs {
+			victim := allp[int((start + u32(i)) % u32(gomaxprocs))]
+			if victim == pp {
+				continue
+			}
+			if gp := runqsteal(pp, victim, false); gp != nil {
+				return gp
+			}
+		}
+	}
+	return nil
+}
+
+// steal_rng is a per-thread xorshift state for choosing a random steal victim.
+@(private)
+@(thread_local)
+steal_rng: u32
+
+// fastrand returns a cheap per-thread pseudo-random u32 (xorshift), seeded lazily
+// from the cycle counter. Used only to spread steal attempts across Ps.
+@(private)
+fastrand :: proc "contextless" () -> u32 {
+	x := steal_rng
+	if x == 0 {
+		x = u32(intrinsics.read_cycle_counter()) | 1
+	}
+	x ~= x << 13
+	x ~= x >> 17
+	x ~= x << 5
+	steal_rng = x
+	return x
 }
 
 // stopm parks this M until a producer posts the idle semaphore or PARK_TIMEOUT
