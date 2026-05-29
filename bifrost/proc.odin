@@ -4,19 +4,22 @@ import "base:intrinsics"
 import "base:runtime"
 import "core:fmt"
 import "core:sync"
+import "core:thread"
+import "core:time"
 
-// Phase 4: a single-M, single-P cooperative scheduler. One OS thread (m0) runs
-// goroutines on its P (allp[0]); goroutines yield voluntarily via gosched, park
-// via gopark, and are resumed via goready. Mirrors the structure of Go's
-// scheduler (proc.go) reduced to one M and one P, with no work stealing,
-// netpoll, sysmon, or preemption yet (those arrive in later phases).
+// Phase 5: a multi-M scheduler. `gomaxprocs` OS threads (m0 = the main thread,
+// plus worker Ms) each pinned to one P run goroutines in parallel; idle Ms park
+// on a shared semaphore and load is balanced by work stealing. Scheduling is
+// still cooperative (no sysmon/preemption): a goroutine yields via gosched,
+// parks via gopark, or finishes to release its M. Mirrors the structure of Go's
+// scheduler (proc.go); deviations are documented at each site.
 //
 // Control-flow model (see asm_amd64.asm): a running goroutine reaches the
 // scheduler by calling mcall(fn), which saves the goroutine's context and runs
-// fn on g0's stack. fn (gosched_m / park_m / goexit0) manipulates queues and
-// calls schedule(), which picks the next goroutine and gogo's into it. The
-// scheduler stack (g0) is reset to a fixed base on every mcall, so it never
-// accumulates frames across switches.
+// fn on its M's g0 stack. fn (gosched_m / park_m / goexit0) manipulates queues
+// and calls schedule(), which picks the next goroutine and gogo's into it. The
+// g0 stack is reset to a fixed base on every mcall, so it never accumulates
+// frames across switches.
 
 // HAVE_SYSMON reports whether a system-monitor thread exists to preempt
 // long-running goroutines. It is false until Phase 10. While false, runqput
@@ -27,15 +30,11 @@ import "core:sync"
 @(private)
 HAVE_SYSMON :: false
 
-// g0_stack is the scheduling stack for m0.g0 (the stack schedule/execute and
-// the mcall continuations run on). Allocated by scheduler_start.
+// PARK_TIMEOUT bounds how long an idle M sleeps before re-polling for work. It
+// is the correctness backstop for parking: a missed/late wakeup only costs up
+// to this much latency, never a lost goroutine. Tunable.
 @(private)
-g0_stack: Stack
-
-// sched_return saves the OS thread's context at the point it entered the
-// scheduler (run); the scheduler gogo's here when no goroutines remain.
-@(private)
-sched_return: Gobuf
+PARK_TIMEOUT :: 200 * time.Microsecond
 
 // Pending park unlock callback + argument, consulted by park_m.
 // DEVIATION: Go stores these on the m (m.waitunlockf / m.waitlock); bifrost is
@@ -59,23 +58,36 @@ go_ :: proc(fn: proc(arg: rawptr), arg: rawptr = nil) {
 	gp := newg(fn, arg)
 	// Enqueue onto the current M's P (allp[0] for the main thread before run).
 	runqput(getm().p, gp, true)
+	wakep()
 }
 
-// run starts the scheduler on the calling OS thread and returns when every
-// goroutine has finished. Call runtime_init first, then go_ to spawn work,
-// then run. Equivalent to the role Go's main thread plays after the runtime
-// boots.
+// run starts the scheduler on `gomaxprocs` OS threads and returns when every
+// goroutine has finished. Call runtime_init first, then go_ to spawn work, then
+// run. It spins up gomaxprocs-1 worker Ms (one per P beyond P0), runs m0's own
+// schedule loop on P0, and on shutdown joins the workers before returning.
 run :: proc() {
 	assert(allp != nil, "bifrost: call runtime_init before run")
 	scheduler_start()
 
-	// Save the OS thread context and jump onto g0 to run schedule(). The
-	// scheduler returns here (via gogo(&sched_return)) once no goroutines
-	// remain runnable.
-	g0_bytes := (cast([^]u8)g0_stack.lo)[:int(g0_stack.hi - g0_stack.lo)]
+	// Spin up one worker M per P beyond P0; each runs schedule() on its own
+	// thread until shutdown.
+	allms = make([]^M, int(gomaxprocs - 1), runtime_allocator)
+	for i in 1 ..< int(gomaxprocs) {
+		allms[i - 1] = newm(allp[i])
+	}
+
+	// m0 runs its own schedule loop on its g0 stack. The loop returns here (via
+	// gogo(&m0.sched_return)) once shutdown is signalled.
+	g0_bytes := stack_to_bytes(m0.g0_stack)
 	setup_context(&g0.sched, cast(rawptr)schedule_bootstrap, g0_bytes)
 	g0.sched.g = &g0 // parity with newg; bifrost's asm never reads gobuf.g today
-	gosave_switch(&sched_return, &g0.sched)
+	gosave_switch(&m0.sched_return, &g0.sched)
+
+	// Shutdown: every worker's schedule loop has (or will) observe sched.shutdown
+	// and exit its thread. Join + free them.
+	for mp in allms {
+		thread.destroy(mp.thread) // joins, then frees the Thread handle
+	}
 }
 
 // gosched yields the processor, allowing other goroutines to run, and resumes
@@ -117,24 +129,27 @@ newg :: proc(fn: proc(arg: rawptr), arg: rawptr) -> ^G {
 
 	gp := gfget(pp)
 	if gp == nil {
-		gp = new(G)
+		gp = new(G, runtime_allocator)
 		s, err := stack_alloc()
 		if err != .None {
 			panic("newg: stack allocation failed")
 		}
 		gp.stack = s
 		casgstatus(gp, .Idle, .Dead) // a zero G reads as _Gidle
+		sync.lock(&allgs_lock)
 		append(&allgs, gp)
+		sync.unlock(&allgs_lock)
 	}
 
 	gp.start_fn = fn
 	gp.start_arg = arg
 
-	stack_bytes := (cast([^]u8)gp.stack.lo)[:int(gp.stack.hi - gp.stack.lo)]
-	setup_context(&gp.sched, cast(rawptr)goexit_entry, stack_bytes)
+	setup_context(&gp.sched, cast(rawptr)goexit_entry, stack_to_bytes(gp.stack))
 	gp.sched.g = gp
 	gp.goid = next_goid()
 
+	// One more live goroutine. goexit0 decrements this; reaching 0 ends the run.
+	intrinsics.atomic_add(&sched.grunning, 1)
 	casgstatus(gp, .Dead, .Runnable)
 	return gp
 }
@@ -183,6 +198,13 @@ goexit0 :: proc "c" (gp: ^G) {
 	gp.waitreason = .None
 	dropg()
 	gfput(getm().p, gp)
+
+	// One fewer live goroutine; when the last one exits, end the whole run.
+	// atomic_add returns the value BEFORE subtracting, so old == 1 means the
+	// new count is 0.
+	if intrinsics.atomic_add(&sched.grunning, -1) == 1 {
+		begin_shutdown()
+	}
 	schedule()
 }
 
@@ -197,18 +219,67 @@ goexit0 :: proc "c" (gp: ^G) {
 // M's lifetime, not per scheduler entry).
 @(private)
 scheduler_start :: proc() {
-	if g0_stack.lo == 0 {
+	if m0.g0_stack.lo == 0 {
 		// A roomier stack for the scheduler than a normal goroutine: schedule
 		// -> execute and the continuations run here.
 		s, err := stack_alloc(STACK_MIN * 4)
 		if err != .None {
 			panic("scheduler_start: g0 stack allocation failed")
 		}
-		g0_stack = s
+		m0.g0_stack = s
 		g0.stack = s
 	}
+	intrinsics.atomic_store_explicit(&sched.shutdown, false, .Release)
 	// Bind the main M to P0 for the duration of the run (idempotent).
 	acquirep(&m0, allp[0])
+}
+
+// newm creates a worker M pinned to pp: it allocates the M, its g0 and g0 stack,
+// binds the P, and starts an OS thread running m_thread_entry. Mirrors newm
+// (proc.go:2866), simplified — bifrost's Ms are pre-created one per P, not on
+// demand. The thread runs with a fresh default context.
+@(private)
+newm :: proc(pp: ^P) -> ^M {
+	mp := new(M, runtime_allocator)
+	g0p := new(G, runtime_allocator)
+	s, err := stack_alloc(STACK_MIN * 4)
+	if err != .None {
+		panic("newm: g0 stack allocation failed")
+	}
+	mp.g0 = g0p
+	mp.g0_stack = s
+	g0p.stack = s
+	g0p.m = mp
+	g0p.atomicstatus = .Running
+	mp.id = i64(pp.id)
+	acquirep(mp, pp)
+	mp.thread = thread.create_and_start_with_data(rawptr(mp), m_thread_entry, runtime.default_context())
+	return mp
+}
+
+// m_thread_entry is a worker M's OS-thread procedure. It installs this thread's
+// tls_m/tls_g, then switches onto the M's g0 stack to run the schedule loop. It
+// returns (ending the thread) only when the schedule loop gogo's back to
+// m.sched_return on shutdown. Mirrors mstart0/mstart1 (proc.go:1866/:1908).
+@(private)
+m_thread_entry :: proc(data: rawptr) {
+	mp := cast(^M)data
+	tls_m = mp
+	tls_g = mp.g0
+	setup_context(&mp.g0.sched, cast(rawptr)mstart_run, stack_to_bytes(mp.g0_stack))
+	mp.g0.sched.g = mp.g0
+	gosave_switch(&mp.sched_return, &mp.g0.sched)
+	// Returned here on shutdown: the thread proc ends and the M becomes joinable.
+}
+
+// mstart_run is a worker M's first frame on its g0 stack (the worker analogue of
+// schedule_bootstrap). Entered via gosave_switch, so it is "c" and establishes a
+// context before entering the scheduler.
+@(private)
+mstart_run :: proc "c" () {
+	context = runtime.default_context()
+	tls_g = getm().g0
+	schedule()
 }
 
 // acquirep associates P pp with M mp and marks it running, the analogue of
@@ -243,42 +314,54 @@ schedule_bootstrap :: proc "c" () {
 	schedule()
 }
 
-// schedule picks the next runnable goroutine and executes it. If none is
-// runnable, it either reports a deadlock (some goroutine is parked with nobody
-// to wake it) or returns control to the OS thread that called run(). Mirrors
-// schedule (proc.go:4141) without findRunnable's stealing/blocking.
+// schedule runs this M's scheduling loop body: pick the next runnable goroutine
+// and execute it. findrunnable only returns nil once shutdown is signalled, at
+// which point this M exits its loop by gogo'ing to its sched_return (run() for
+// m0, the thread proc for workers). Mirrors schedule (proc.go:4141).
 @(private)
 schedule :: proc() {
 	gp := findrunnable()
 	if gp == nil {
-		check_dead() // panics on deadlock / lost wakeup; returns only if all dead
-		gogo(&sched_return) // no work left: return to run()'s caller
+		gogo(&getm().sched_return) // shutdown: leave this M
 		return // unreachable: gogo does not return, but the compiler can't know
 	}
 	execute(gp)
 }
 
-// check_dead inspects every goroutine when the run queues have drained, to tell
-// apart three terminal situations. A goroutine left _Grunnable/_Grunning while
-// the scheduler is idle is a lost-wakeup invariant violation (a bug). If the
-// only survivors are _Gwaiting, the program is genuinely deadlocked — report
-// each parked goroutine's id and wait reason. If everything is dead, return so
-// the caller hands control back to the OS thread. Mirrors Go's checkdead
-// (proc.go).
+// begin_shutdown signals every M to stop and wakes them all. Called once, when
+// the last live goroutine exits (grunning hits 0).
 @(private)
-check_dead :: proc() {
-	runnable := 0
+begin_shutdown :: proc() {
+	intrinsics.atomic_store_explicit(&sched.shutdown, true, .Release)
+	sync.sema_post(&sched.idle_sema, int(gomaxprocs))
+}
+
+// wakep wakes one idle M (best-effort) after work is made available. Correctness
+// does not depend on it — parked Ms also re-poll on PARK_TIMEOUT — but it cuts
+// scheduling latency.
+@(private)
+wakep :: proc() {
+	sync.sema_post(&sched.idle_sema)
+}
+
+// report_deadlock_if_stuck is called when an M observes that all Ms are idle yet
+// live goroutines remain. If any goroutine is runnable a wakeup is merely
+// pending (not a deadlock); if every survivor is _Gwaiting the program is
+// genuinely deadlocked, so report each one's id and wait reason and abort.
+// Mirrors Go's checkdead (proc.go).
+@(private)
+report_deadlock_if_stuck :: proc() {
+	sync.lock(&allgs_lock)
+	defer sync.unlock(&allgs_lock)
+
 	waiting := 0
 	for gp in allgs {
 		#partial switch g_status(gp) {
 		case .Runnable, .Running:
-			runnable += 1
+			return // a goroutine can still run; a wakeup is in flight
 		case .Waiting:
 			waiting += 1
 		}
-	}
-	if runnable > 0 {
-		fmt.panicf("checkdead: %d runnable goroutine(s) but the scheduler is idle (lost wakeup)", runnable)
 	}
 	if waiting > 0 {
 		for gp in allgs {
@@ -302,15 +385,43 @@ execute :: proc(gp: ^G) {
 	gogo(&gp.sched)
 }
 
-// findrunnable returns the next goroutine to run: local run queue first, then
-// the global queue. Single-M, so no work stealing or netpoll. Mirrors the
-// fast path of findRunnable (proc.go).
+// findrunnable returns the next goroutine to run, or nil only when shutdown has
+// been signalled. It checks the local run queue, then the global queue; if both
+// are empty it parks the M (stopm) and retries. Mirrors the structure of
+// findRunnable (proc.go:3395) minus netpoll; work stealing is added in
+// stealWork-equivalent steal_work() (Inc 4).
 @(private)
 findrunnable :: proc() -> ^G {
-	if gp := runqget(getm().p); gp != nil {
-		return gp
+	mp := getm()
+	for {
+		if gp := runqget(mp.p); gp != nil {
+			return gp
+		}
+		if gp := globrunqget(); gp != nil {
+			return gp
+		}
+		if intrinsics.atomic_load_explicit(&sched.shutdown, .Acquire) {
+			return nil
+		}
+		stopm()
+		if intrinsics.atomic_load_explicit(&sched.shutdown, .Acquire) {
+			return nil
+		}
 	}
-	return globrunqget()
+}
+
+// stopm parks this M until a producer posts the idle semaphore or PARK_TIMEOUT
+// elapses, then returns so findrunnable can re-poll. Before sleeping, if this M
+// going idle means every M is idle while goroutines still exist, it checks for a
+// genuine deadlock. Mirrors stopm/mPark (proc.go:2998).
+@(private)
+stopm :: proc() {
+	n := intrinsics.atomic_add(&sched.nidle, 1) + 1
+	if n == gomaxprocs && intrinsics.atomic_load_explicit(&sched.grunning, .Acquire) > 0 {
+		report_deadlock_if_stuck()
+	}
+	sync.sema_wait_with_timeout(&sched.idle_sema, PARK_TIMEOUT)
+	intrinsics.atomic_add(&sched.nidle, -1)
 }
 
 // mcall saves the current goroutine and runs fn(gp) on the scheduler stack.
@@ -335,6 +446,7 @@ gosched_m :: proc "c" (gp: ^G) {
 	casgstatus(gp, .Running, .Runnable)
 	dropg()
 	globrunqput(gp)
+	wakep() // another M may grab the yielded goroutine
 	schedule()
 }
 
@@ -381,12 +493,23 @@ ready :: proc(gp: ^G) {
 	}
 	casgstatus(gp, .Waiting, .Runnable)
 	runqput(getm().p, gp, true)
+	wakep() // an idle M may pick up the readied goroutine
 }
 
-// live_goroutines counts goroutines that are not dead; used to distinguish "all
-// work finished" from "deadlock" when the run queues drain.
+// stack_to_bytes views a Stack's [lo, hi) region as a byte slice, for passing to
+// setup_context.
+@(private)
+stack_to_bytes :: proc "contextless" (s: Stack) -> []u8 {
+	return (cast([^]u8)s.lo)[:int(s.hi - s.lo)]
+}
+
+// live_goroutines counts goroutines that are not dead. Safe to call only when no
+// M is scheduling (e.g. after run() has returned); tests use it to confirm a
+// clean finish.
 @(private)
 live_goroutines :: proc() -> int {
+	sync.lock(&allgs_lock)
+	defer sync.unlock(&allgs_lock)
 	n := 0
 	for gp in allgs {
 		if g_status(gp) != .Dead {
@@ -655,20 +778,29 @@ gfget :: proc(pp: ^P) -> ^G {
 // some pieces were never allocated.
 @(private)
 runtime_teardown :: proc() {
+	// Worker Ms: their OS threads were already joined + destroyed by run(); free
+	// each M's g0 stack, g0, and the M itself.
+	for mp in allms {
+		stack_free(mp.g0_stack)
+		free(mp.g0, runtime_allocator)
+		free(mp, runtime_allocator)
+	}
+	delete(allms, runtime_allocator)
+	allms = nil
+
 	for gp in allgs {
 		stack_free(gp.stack)
-		free(gp)
+		free(gp, runtime_allocator)
 	}
 	delete(allgs)
 	allgs = nil
 
-	stack_free(g0_stack)
-	g0_stack = {}
+	stack_free(m0.g0_stack)
 
 	for pp in allp {
-		free(pp)
+		free(pp, runtime_allocator)
 	}
-	delete(allp)
+	delete(allp, runtime_allocator)
 	allp = nil
 
 	sched = {}

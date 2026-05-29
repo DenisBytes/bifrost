@@ -1,6 +1,8 @@
 package bifrost
 
+import "base:runtime"
 import "core:sync"
+import "core:thread"
 
 // RUNQ_SIZE is the capacity of a P's local run queue ring buffer. Matches
 // Go's fixed 256 (runtime2.go: p.runq [256]guintptr).
@@ -104,14 +106,21 @@ M :: struct {
 	// scheduler itself (schedule, gopark, etc.) runs, separate from any user
 	// goroutine's stack.
 	g0: ^G,
+	// g0_stack is the mmap'd stack backing g0 (freed at teardown).
+	g0_stack: Stack,
 	// curg is the user goroutine this M is currently running, or nil.
 	curg: ^G,
-	// p is the P this M is bound to while running goroutine code, or nil.
+	// p is the P this M is bound to. In bifrost each M is pinned to one P for
+	// its lifetime (DEVIATION: Go hands Ps between Ms; bifrost balances by work
+	// stealing instead).
 	p: ^P,
-	// nextp is the P to bind before the next execute (Phase 5 handoff).
-	nextp: ^P,
-	// id is a unique M id; m0 (the main thread) is 0.
+	// id is a unique M id (== its P's id). m0 (the main thread) is 0.
 	id: i64,
+	// sched_return is where this M's schedule loop returns to on shutdown:
+	// run() for m0, m_thread_entry (ending the thread) for workers.
+	sched_return: Gobuf,
+	// thread is the OS thread handle for a worker M (nil for m0), used to join.
+	thread: ^thread.Thread,
 	// alllink threads this M onto the global allm list.
 	alllink: ^M,
 }
@@ -145,17 +154,23 @@ Schedt :: struct {
 	// goidgen is the monotonically increasing goroutine id counter, bumped
 	// atomically by newg. Mirrors goidgen atomic.Uint64.
 	goidgen: u64,
-	// lock guards the global runq and idle lists.
+	// lock guards the global runq.
 	lock: sync.Mutex,
 	// runq is the global run queue, a fallback/overflow for the per-P runqs.
 	runq: G_Queue,
-	// midle is the list of idle Ms waiting for work; npidle/nmidle count them.
-	// Idle lists are exercised starting in Phase 5 (multi-M).
-	midle:  ^M,
-	nmidle: i32,
-	// pidle is the list of idle Ps.
-	pidle:  ^P,
-	npidle: i32,
+	// idle_sema is the shared park point for idle Ms: a producer posts it to
+	// wake one M; idle Ms wait on it with a timeout (see stopm). One shared
+	// sema replaces Go's per-M notes + idle-M list.
+	idle_sema: sync.Sema,
+	// grunning is the number of live (non-dead) goroutines, bumped atomically by
+	// newg and goexit0. When it reaches 0 the run is complete (begin_shutdown).
+	grunning: i32,
+	// nidle counts Ms currently parked in stopm (atomic); used to detect "all
+	// Ms idle" for deadlock reporting.
+	nidle: i32,
+	// shutdown, once set (atomic), tells every M's findrunnable to return nil so
+	// the schedule loop exits.
+	shutdown: bool,
 }
 
 // Package-global runtime state. Mirrors Go's runtime globals (proc.go /
@@ -169,11 +184,29 @@ allm: ^M
 @(private)
 allp: []^P
 
+// allms holds the worker Ms created by run() (one per P beyond P0), for joining
+// and freeing. m0 is not in this slice.
+@(private)
+allms: []^M
+
 @(private)
 sched: Schedt
 
 @(private)
 gomaxprocs: i32
+
+// runtime_allocator is the single allocator used for all runtime-owned objects
+// (G, P, M, the allp/allms/allgs backing). Captured at runtime_init so that
+// allocations made from any M's thread and the frees at teardown use one
+// consistent, thread-safe allocator. The default heap allocator is malloc-
+// backed and safe to call from multiple threads.
+@(private)
+runtime_allocator: runtime.Allocator
+
+// allgs_lock guards appends to and scans of allgs, which are now performed from
+// multiple Ms (newg, deadlock reporting, teardown).
+@(private)
+allgs_lock: sync.Mutex
 
 // m0 is the M for the main OS thread; g0 is its scheduling goroutine.
 @(private)
@@ -203,7 +236,10 @@ runtime_init :: proc(procs: i32, allocator := context.allocator) {
 	assert(procs >= 1, "runtime_init: gomaxprocs must be >= 1")
 
 	gomaxprocs = procs
+	runtime_allocator = allocator
 	sched = {}
+	allgs_lock = {}
+	allgs = make([dynamic]^G, 0, 0, allocator)
 
 	allp = make([]^P, int(procs), allocator)
 	for i in 0 ..< int(procs) {
