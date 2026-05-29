@@ -378,9 +378,18 @@
 
 ## Phase 8 — `sync` primitives
 
-- [ ] **8.1 Runtime semaphore (`semacquire`/`semrelease`).**
-      The foundation. See `sema.go`. Built on `gopark`/`goready`,
-      hashed `semaRoot` treaps.
+- [x] **8.1 Runtime semaphore (`sema_acquire`/`sema_release`).**
+      `Sema_Root` hash table (31 buckets), `cansemacquire` atomic CAS-decrement,
+      slow path queues a `Sudog` and `gopark`s with `sema_park_commit`. The
+      lost-wakeup dance — `xadd(*addr)` before `load(nwait)` on release, paired
+      with `nwait++` before recheck-`cansemacquire` on acquire — closes the
+      missed-wake window without a global lock. DEVIATIONS: FIFO linked-list per
+      bucket with linear-scan dequeue (vs Go's treap of addrs); no `s.ticket`
+      direct-handoff path (no anti-starvation regime yet). Hardening folded into
+      this commit: `runtime_teardown` panics if `sema_table` leaks (loud bug
+      attribution), and `acquire_sudog` now asserts every field clean. Tests:
+      pre-released, parks-then-wakes, counting, binary-as-mutex, and 4-thread
+      stress (5000 mutex + 2000 producer/consumer), looped 15× clean.
 - [ ] **8.2 `Mutex`.**
       Spin a few times, then `semacquire`. See `src/sync/mutex.go`.
 - [ ] **8.3 `WaitGroup`.**

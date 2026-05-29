@@ -1004,8 +1004,24 @@ acquire_sudog :: proc() -> ^Sudog {
 	pp.sudogcache_n -= 1
 	s := pp.sudogcache[pp.sudogcache_n]
 	pp.sudogcache[pp.sudogcache_n] = nil
+	// Symmetric with release_sudog: a cached sudog must be fully detached. If any
+	// of these fire, an upstream waiter (chan / select / sema) failed to clear a
+	// field before release — catch it at the next acquire rather than letting it
+	// silently corrupt the new op.
 	if s.elem != nil {
 		panic("acquire_sudog: cached sudog has non-nil elem")
+	}
+	if s.waitlink != nil {
+		panic("acquire_sudog: cached sudog has non-nil waitlink")
+	}
+	if s.next != nil || s.prev != nil {
+		panic("acquire_sudog: cached sudog still linked in a waitq")
+	}
+	if s.c != nil {
+		panic("acquire_sudog: cached sudog has non-nil c")
+	}
+	if s.isSelect {
+		panic("acquire_sudog: cached sudog has isSelect set")
 	}
 	// release_sudog does not clear success, so a recycled sudog still carries the
 	// previous op's result. Reset it here to a clean false: every wake path must
@@ -1129,4 +1145,15 @@ runtime_teardown :: proc() {
 	g0 = {}
 	tls_g = nil
 	tls_m = nil
+	// A leaked sema_acquire would leave a Sudog in some bucket's head/tail:
+	// sudog_pool_free walks per-P caches + central list, NOT sema_table, so the
+	// dangling Sudog would otherwise leak silently and a future `sema_table = {}`
+	// would orphan its allocation. Panic loudly so the bug points at the right
+	// place (unreleased acquirer), not at a phantom allocator leak.
+	for &root in sema_table {
+		if root.head != nil || root.tail != nil || root.nwait != 0 {
+			panic("runtime_teardown: sema_table not drained (leaked sema_acquire)")
+		}
+	}
+	sema_table = {}
 }
