@@ -390,8 +390,16 @@
       attribution), and `acquire_sudog` now asserts every field clean. Tests:
       pre-released, parks-then-wakes, counting, binary-as-mutex, and 4-thread
       stress (5000 mutex + 2000 producer/consumer), looped 15× clean.
-- [ ] **8.2 `Mutex`.**
-      Spin a few times, then `semacquire`. See `src/sync/mutex.go`.
+- [x] **8.2 `Mutex`.**
+      Binary semaphore over a single `u32`: `mutex_lock` is `sema_acquire`,
+      `mutex_unlock` is `sema_release`, `mutex_init` sets the available permit.
+      DEVIATIONS from `sync.Mutex`: requires explicit init (Go's zero-value
+      Mutex works because it encodes the lock + waiter count in one u32 with a
+      fast-path CAS and a slow-path sema); no spinning, no starvation mode —
+      fairness follows the sema's FIFO. Tests: basic lock/unlock, blocks-until-
+      released (single-M with `gosched`), uncontended loop; 4-thread integration
+      stresses 5000 acquisitions on one Mutex plus 2×2000 on two independent
+      Mutexes (cross-bucket isolation), looped 10× clean.
 - [ ] **8.3 `WaitGroup`.**
       Atomic counter + sema. See `src/sync/waitgroup.go`.
 - [ ] **8.4 `Once`.**
