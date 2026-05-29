@@ -223,28 +223,103 @@
 
 ---
 
+## Phase 5.5 — Scheduler hardening (pre-flight before channels)
+
+> A code review of Phase 5 surfaced one bug that *blocks* channels plus a
+> cluster of robustness gaps. Channels are the first real consumer of
+> `gopark` with a non-nil unlock callback (`hchan.lock`) driven by many
+> goroutines at once, so the park/wakeup/deadlock machinery must be correct
+> and lock-serialized first. SCOPE (agreed with user): full hardening — port
+> Go's idle-M-list + per-M note model and run `checkdead` under `sched.lock`,
+> not just the one blocking fix.
+
+- [x] **5.5.1 Park callback onto M (BLOCKS Phase 6).**
+      Move `park_unlockf`/`park_lock` (package globals — a cross-M data race)
+      onto `M.waitunlockf`/`M.waitlock`, mirroring Go's `m.waitunlockf` /
+      `m.waitlock` (`runtime2.go` m struct). `gopark` sets them via `getm()`;
+      `park_m` reads them via `getm()` (same M — `mcall` switches to g0, not to
+      another thread). Update the stale `proc.odin:40-41` comment.
+- [x] **5.5.2 Fail-fast on thread spawn.**
+      `newm` must check `thread.create_and_start_with_data` for `nil` and
+      `panic` (consistent with the adjacent `stack_alloc` panic). A silent
+      `nil` later hits `thread.destroy(nil)` and breaks the
+      `gomaxprocs == live-Ms` invariant the deadlock detector relies on.
+- [x] **5.5.3 Always-on ring-overflow guard.**
+      `runqsteal`'s overflow check is an `assert` (stripped in release →
+      silent ring corruption). Replace with an unconditional `panic`, mirroring
+      Go's always-on `throw` (`proc.go` runqsteal).
+- [x] **5.5.4 Per-M note + idle-M list (replace the shared counting sema).**
+      The shared `sync.Sema` is a *counting* sema, so `wakep` over-posts and
+      idle Ms busy-spin draining stale permits. Port Go's model: each M parks
+      on its own one-shot note (`M.park: sync.Sema`, used binary), and `sched`
+      keeps a LIFO idle-M list (`mput`/`mget` under `sched.lock`, mirror
+      `proc.go` mput/mget). `wakep` pops exactly one idle M and wakes it;
+      `begin_shutdown` wakes every idle M. Keep a long `PARK_TIMEOUT` only as a
+      paranoia backstop. Permits no longer accumulate → state is clean across
+      repeated `run()`.
+- [x] **5.5.5 `checkdead` under `sched.lock`.**
+      Determine "all Ms idle" from the idle-list count while holding
+      `sched.lock` (mirror `proc.go:6397` `checkdead`) so the queue-empty
+      check + idle count + status scan are one consistent snapshot.
+      Distinguish a true all-`_Gwaiting` deadlock (panic with goids + wait
+      reasons) from a *lost wakeup* (runnable work exists yet all Ms idle →
+      loud, distinct error), restoring the lost-wakeup invariant the Phase-4
+      `check_dead` had and the Phase-5 rewrite dropped.
+- [x] **5.5.6 Comment-honesty pass (CLAUDE.md rule 2).**
+      Fix stale "Phase 5 will…" caveats now that Phase 5 is done: the goexit
+      temp-allocator caveat (`proc.odin:166-170`) and the `casgstatus`
+      single-M justification (`status.odin`) — each restated to reflect
+      multi-M reality or its real deferral phase.
+- [x] **5.5.7 Re-verify.**
+      `make check`/`test`/`test-integration` green; integration looped ≥20×
+      with no race/deadlock; assert the idle-list/notes drain clean across
+      repeated `run()` rounds.
+
+---
+
 ## Phase 6 — Channels
 
-- [ ] **6.1 `sudog` pool.**
-      Mirror `runtime2.go:404` and `proc.go:492` `acquireSudog` /
-      `releaseSudog`. Per-P cache + central freelist.
-- [ ] **6.2 `hchan` struct + `make_chan(elem_size, capacity)`.**
-      Mirror `chan.go:34`. Allocate ring buffer inline after the
-      header for efficiency, like `chan.go` `makechan`.
+> API decision (agreed with user): an **untyped core** that mirrors Go's
+> `chan.go` one-to-one for grep-parity (operates on `elem_size` + `rawptr`),
+> plus a thin **generic `Chan(T)` wrapper** for type-safe ergonomics. The
+> `block bool` parameter is threaded through `chansend`/`chanrecv` from the
+> start (only `block=true` is exercised now) so Phase 7 `select`'s
+> non-blocking probes drop in cheaply.
+
+- [ ] **6.1 `Sudog` + `Waitq` + sudog pool.**
+      `Sudog` = subset of `runtime2.go:404` (`g`, `next`, `prev`, `elem`,
+      `success`, `c`, `isSelect`); `Waitq{first,last}` with enqueue/dequeue.
+      `acquire_sudog`/`release_sudog` with a per-P cache backed by a central
+      freelist under `sched.lock`, mirroring `proc.go:492`.
+- [ ] **6.2 `Hchan` struct + `make_chan(elem_size, capacity)` + `close_chan`.**
+      Untyped core mirroring `chan.go:34`: `qcount, dataqsiz, buf, elem_size,
+      closed, sendx, recvx, sendq, recvq, lock: sync.Mutex`. Allocate the ring
+      buffer inline after the header like `chan.go` `makechan`.
 - [ ] **6.3 Unbuffered send/recv (synchronous handoff).**
-      Implement the "direct send" path: if a receiver is waiting,
-      copy element straight to its frame and `goready` it; else park
-      sender on `hchan.sendq`. See `chan.go` `chansend`, `chanrecv`,
-      `send`, `recv`.
+      `chansend(c, elem, block)` / `chanrecv(c, elem, block)`: if a peer
+      waits, `send`/`recv` copies the element straight across the parked
+      goroutine's `sg.elem` and `goready`s it; else park on `sendq`/`recvq`
+      via `gopark(chanparkcommit, &c.lock, …)` — now safe thanks to **5.5.1**.
+      `chanparkcommit(gp, lock)` unlocks `c.lock` after the status flip. See
+      `chan.go` `chansend`/`chanrecv`/`send`/`recv`/`chanparkcommit`.
 - [ ] **6.4 Buffered send/recv.**
-      Add the ring-buffer fast path with `qcount`, `dataqsiz`,
-      `sendx`, `recvx`. See same functions in `chan.go`.
-- [ ] **6.5 `close(ch)`.**
-      Wake all senders (panic on send to closed) and all receivers
-      (return zero value, ok=false). See `chan.go` `closechan`.
-- [ ] **6.6 Acceptance: classic worker pool.**
-      Producer goroutine pushes 10k ints into a buffered chan
-      (cap 16), N consumers drain. Sum matches expected.
+      Ring-buffer fast path with `qcount`/`dataqsiz`/`sendx`/`recvx`, including
+      the buffered-and-sender-waiting rotate in `recv`. Same `chan.go`
+      functions.
+- [ ] **6.5 `close_chan`.**
+      Wake all `sendq` waiters (they panic on resume: send on closed channel)
+      and all `recvq` waiters (zero value, `ok=false`). Panic on close of a
+      closed/nil channel. See `chan.go` `closechan`.
+- [ ] **6.6 Typed `Chan(T)` wrapper.**
+      `Chan :: struct($T)` over `^Hchan`; `chan_make($T, cap)`,
+      `chan_send(ch, v)`, `chan_recv(ch) -> (T, bool)`, `chan_close(ch)` —
+      thin parametric-polymorphism wrappers that `size_of(T)` into the untyped
+      core and copy via `&v`.
+- [ ] **6.7 Acceptance: worker pool + unbuffered ping-pong.**
+      Producer pushes 10k ints into a buffered chan (cap 16); N consumer
+      goroutines drain; sum matches expected. Plus an unbuffered ping-pong
+      proving synchronous handoff. Multi-M (`runtime_init(4)`) integration
+      stress, looped, leak-clean. `examples/` gets a `chan` worker-pool demo.
 
 ---
 

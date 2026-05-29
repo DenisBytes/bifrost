@@ -38,11 +38,12 @@ Wait_Reason :: enum {
 
 // casgstatus atomically transitions gp.atomicstatus from old to new.
 //
-// Go's casgstatus (proc.go) spins to tolerate the GC's _Gscan bit and throws
-// on impossible transitions. bifrost has no GC and no _Gscan bit, and in the
-// single-M cooperative scheduler the caller always knows the current status,
-// so a failed CAS means a logic bug: we panic, mirroring Go's throw rather
-// than spinning forever.
+// Go's casgstatus (proc.go) spins to tolerate the GC's _Gscan bit and throws on
+// impossible transitions. bifrost has no GC and no _Gscan bit, so there is no
+// transient bit to spin past: a status transition is owned by exactly one M at a
+// time (the M running the g, or the M that dequeued it). A failed CAS therefore
+// means a real logic or run-queue-invariant violation — e.g. two Ms dequeued the
+// same g — so we panic (fail fast), mirroring Go's throw rather than spinning.
 casgstatus :: proc(gp: ^G, old, new: G_Status) {
 	if old == new {
 		fmt.panicf("casgstatus: old == new (%v)", old)

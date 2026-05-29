@@ -9,7 +9,8 @@ import "core:time"
 
 // Phase 5: a multi-M scheduler. `gomaxprocs` OS threads (m0 = the main thread,
 // plus worker Ms) each pinned to one P run goroutines in parallel; idle Ms park
-// on a shared semaphore and load is balanced by work stealing. Scheduling is
+// on their own per-M note (tracked on sched.midle) and load is balanced by work
+// stealing. Scheduling is
 // still cooperative (no sysmon/preemption): a goroutine yields via gosched,
 // parks via gopark, or finishes to release its M. Mirrors the structure of Go's
 // scheduler (proc.go); deviations are documented at each site.
@@ -30,20 +31,22 @@ import "core:time"
 @(private)
 HAVE_SYSMON :: false
 
-// PARK_TIMEOUT bounds how long an idle M sleeps before re-polling for work. It
-// is the correctness backstop for parking: a missed/late wakeup only costs up
-// to this much latency, never a lost goroutine. Tunable.
+// PARK_TIMEOUT bounds how long an idle M sleeps before re-polling for work.
+//
+// It is LOAD-BEARING for work-handoff liveness, not a mere latency tweak.
+// bifrost deliberately omits Go's spinning-M protocol (the nmspinning "delicate
+// dance"), so the wakeup is best-effort: a producer that publishes a goroutine
+// onto its local P ring (runqput is lock-free) and then calls wakep can find no
+// idle M to signal precisely because the consumer polled-empty but had not yet
+// listed itself on sched.midle. That goroutine is then picked up only by a
+// re-poll, which PARK_TIMEOUT bounds. checkdead relies on the same fact: it
+// refuses to call a _Grunnable-while-all-idle state a deadlock because this
+// timeout resolves it. (Shutdown does NOT depend on the timeout — stopm
+// re-checks sched.shutdown under sched.lock.) Tunable, but raising it directly
+// raises worst-case handoff latency under contention; the real fix for the
+// window is spinning Ms in a later phase.
 @(private)
 PARK_TIMEOUT :: 200 * time.Microsecond
-
-// Pending park unlock callback + argument, consulted by park_m.
-// DEVIATION: Go stores these on the m (m.waitunlockf / m.waitlock); bifrost is
-// single-M, so package globals suffice until Phase 5 moves them onto M.
-@(private)
-park_unlockf: proc "c" (gp: ^G, lock: rawptr) -> bool
-
-@(private)
-park_lock: rawptr
 
 // ---------------------------------------------------------------------------
 // Public API
@@ -104,9 +107,13 @@ gosched :: proc() {
 // (proc.go:449).
 gopark :: proc(unlockf: proc "c" (gp: ^G, lock: rawptr) -> bool, lock: rawptr, reason: Wait_Reason) {
 	gp := getg()
+	mp := getm()
 	gp.waitreason = reason
-	park_unlockf = unlockf
-	park_lock = lock
+	// Stash the callback on THIS M, not a package global: another goroutine on a
+	// different M may be parking at the same instant, and each must run its own
+	// unlockf against its own lock. park_m (same M, on g0) reads these back.
+	mp.waitunlockf = unlockf
+	mp.waitlock = lock
 	mcall(park_m)
 }
 
@@ -163,11 +170,15 @@ newg :: proc(fn: proc(arg: rawptr), arg: rawptr) -> ^G {
 // then exits. Entered via gogo, so it has no incoming context — hence "c" and
 // the explicit context setup, mirroring how core:thread bootstraps a thread.
 //
-// PHASE-5 CAVEAT: runtime.default_context() hands every goroutine the SAME
-// process-global temp allocator and heap allocator. That is safe under the
-// single-M cooperative scheduler (no two goroutines run at once), but the
-// global temp allocator is not thread-safe — Phase 5 (multi-M) must give each
-// goroutine its own context/temp allocator and restore it on resume.
+// ALLOCATOR NOTE: runtime.default_context() gives a malloc-backed heap allocator
+// (thread-safe) and Odin's default temp allocator, which is @(thread_local) —
+// so each OS thread has its own temp arena and concurrent goroutines on
+// different Ms never share one. Two real limits remain, neither hit by current
+// code paths: (1) a goroutine that temp-allocates, is stolen, and resumes on
+// another M reads the first M's arena, since context is rebuilt per OS thread,
+// not carried with the goroutine; (2) the temp arena is never reset, so it grows
+// across a long run. A per-goroutine context saved/restored across the switch is
+// deferred until a goroutine path actually uses the temp allocator (Phase 8+).
 //
 // DEVIATION: Go threads the equivalent of this trampoline through goexit as the
 // new goroutine's return address (proc.go newproc1 + asm goexit); bifrost uses
@@ -258,6 +269,13 @@ newm :: proc(pp: ^P) -> ^M {
 	mp.id = i64(pp.id)
 	acquirep(mp, pp)
 	mp.thread = thread.create_and_start_with_data(rawptr(mp), m_thread_entry, runtime.default_context())
+	// A nil handle means the OS refused the thread (e.g. RLIMIT). bifrost pins
+	// one M per P up front, so a missing worker would silently break the
+	// gomaxprocs==live-Ms invariant checkdead relies on, then crash later on
+	// thread.destroy(nil). Fail loudly here instead, like the stack_alloc panic.
+	if mp.thread == nil {
+		panic("newm: OS thread creation failed")
+	}
 	return mp
 }
 
@@ -333,28 +351,122 @@ schedule :: proc() {
 }
 
 // begin_shutdown signals every M to stop and wakes them all. Called once, when
-// the last live goroutine exits (grunning hits 0).
+// the last live goroutine exits (grunning hits 0). Any M not yet parked observes
+// sched.shutdown directly in findrunnable; an M that parks just after we drain
+// the list is caught by its PARK_TIMEOUT re-poll.
 @(private)
 begin_shutdown :: proc() {
 	intrinsics.atomic_store_explicit(&sched.shutdown, true, .Release)
-	sync.sema_post(&sched.idle_sema, int(gomaxprocs))
+	sync.lock(&sched.lock)
+	for {
+		mp := mget()
+		if mp == nil {
+			break
+		}
+		sync.sema_post(&mp.park)
+	}
+	sync.unlock(&sched.lock)
 }
 
-// wakep wakes one idle M (best-effort) after work is made available. Correctness
-// does not depend on it — parked Ms also re-poll on PARK_TIMEOUT — but it cuts
+// wakep wakes one idle M after work is made available, by popping it off the
+// idle list and posting its private note. Posting only a genuinely-parked M
+// (never a blind post) is what keeps each note near-binary and avoids the
+// stale-permit busy-spin a single shared semaphore would cause. (A timeout/post
+// race can still leave at most one stray permit on a note; it is consumed as one
+// benign spurious wakeup on that M's next park — see M.park.) Correctness does
+// not hinge on wakep — a parked M also re-polls on PARK_TIMEOUT — but it cuts
 // scheduling latency.
 @(private)
 wakep :: proc() {
-	sync.sema_post(&sched.idle_sema)
+	sync.lock(&sched.lock)
+	mp := mget()
+	sync.unlock(&sched.lock)
+	if mp != nil {
+		sync.sema_post(&mp.park)
+	}
 }
 
-// report_deadlock_if_stuck is called when an M observes that all Ms are idle yet
-// live goroutines remain. If any goroutine is runnable a wakeup is merely
-// pending (not a deadlock); if every survivor is _Gwaiting the program is
-// genuinely deadlocked, so report each one's id and wait reason and abort.
-// Mirrors Go's checkdead (proc.go).
+// mput pushes mp onto the idle-M LIFO and runs the deadlock check. Caller must
+// hold sched.lock. Mirrors Go's mput (proc.go:7230), which likewise calls
+// checkdead under the lock.
 @(private)
-report_deadlock_if_stuck :: proc() {
+mput :: proc(mp: ^M) {
+	mp.idle_link = sched.midle
+	sched.midle = mp
+	sched.nmidle += 1
+	checkdead()
+}
+
+// mget pops one idle M off the LIFO, or nil. Caller must hold sched.lock.
+// Mirrors Go's mget (proc.go:7243).
+@(private)
+mget :: proc() -> ^M {
+	mp := sched.midle
+	if mp != nil {
+		sched.midle = mp.idle_link
+		mp.idle_link = nil
+		sched.nmidle -= 1
+	}
+	return mp
+}
+
+// mget_specific removes mp from the idle list if present (no-op otherwise), so an
+// M that woke on its PARK_TIMEOUT can delist itself. Caller must hold sched.lock.
+// Mirrors Go's mgetSpecific (proc.go:7260).
+//
+// DEVIATION: Go's mgetSpecific is O(1) — its idle list is an intrusive
+// doubly-linked list and membership is a prev/next == 0 test. bifrost's midle is
+// a singly-linked LIFO, so this walks the list (bounded by gomaxprocs, tiny).
+// nmidle is decremented only on an actual unlink, so a no-op (already popped by a
+// waker) leaves the count correct.
+@(private)
+mget_specific :: proc(mp: ^M) {
+	prev: ^M
+	for cur := sched.midle; cur != nil; cur = cur.idle_link {
+		if cur == mp {
+			if prev == nil {
+				sched.midle = cur.idle_link
+			} else {
+				prev.idle_link = cur.idle_link
+			}
+			mp.idle_link = nil
+			sched.nmidle -= 1
+			return
+		}
+		prev = cur
+	}
+}
+
+// checkdead reports a genuine deadlock: every M parked while live goroutines
+// remain, all of them _Gwaiting with no one left to wake them. Caller must hold
+// sched.lock; called from mput when an M parks. Mirrors Go's checkdead
+// (proc.go:6397).
+//
+// LOCK ORDER: this takes allgs_lock while already holding sched.lock, so the
+// ordering is sched.lock -> allgs_lock. Nothing may take them in the reverse
+// order (newg/live_goroutines take allgs_lock alone and never grab sched.lock
+// under it); see the lock field doc comments in runtime2.odin.
+//
+// DEVIATION: Go also throws on finding a _Grunnable g while every M is idle
+// (a lost wakeup). bifrost does NOT — its PARK_TIMEOUT re-poll recovers a
+// runnable-but-unscheduled g, so that state is benign here, not fatal. Only the
+// all-_Gwaiting case (which no re-poll can resolve) is a true deadlock.
+//
+// CAVEAT (revisit in Phase 9/11): this is sound only while the sole way a
+// _Gwaiting g becomes runnable is goready from a goroutine running on a non-idle
+// M (so any in-flight wakeup keeps gomaxprocs-nmidle > 0 and short-circuits the
+// scan before it can fire). Async readiers — timer expiry (Phase 9) and netpoll
+// (Phase 11) — can ready a g while every M is idle, so they must re-examine this
+// "all idle => deadlock" inference before they land.
+@(private)
+checkdead :: proc() {
+	// bifrost runs a fixed pool of exactly gomaxprocs Ms (m0 + workers), so
+	// "running Ms" is gomaxprocs - nmidle. While any M still runs, it (or a
+	// steal) will reach the work; not dead.
+	if gomaxprocs - sched.nmidle > 0 {
+		return
+	}
+
 	sync.lock(&allgs_lock)
 	defer sync.unlock(&allgs_lock)
 
@@ -362,7 +474,7 @@ report_deadlock_if_stuck :: proc() {
 	for gp in allgs {
 		#partial switch g_status(gp) {
 		case .Runnable, .Running:
-			return // a goroutine can still run; a wakeup is in flight
+			return // recoverable: a PARK_TIMEOUT re-poll will run it
 		case .Waiting:
 			waiting += 1
 		}
@@ -375,6 +487,8 @@ report_deadlock_if_stuck :: proc() {
 		}
 		panic("all goroutines are asleep - deadlock!")
 	}
+	// waiting == 0: no non-dead goroutines remain (run is finishing). Not a
+	// deadlock — shutdown is in flight.
 }
 
 // execute runs gp: bind it to the M, flip _Grunnable -> _Grunning, and gogo
@@ -462,18 +576,40 @@ fastrand :: proc "contextless" () -> u32 {
 	return x
 }
 
-// stopm parks this M until a producer posts the idle semaphore or PARK_TIMEOUT
-// elapses, then returns so findrunnable can re-poll. Before sleeping, if this M
-// going idle means every M is idle while goroutines still exist, it checks for a
-// genuine deadlock. Mirrors stopm/mPark (proc.go:2998).
+// stopm parks this M until wakep posts its private note or PARK_TIMEOUT elapses,
+// then returns so findrunnable can re-poll. It lists itself on sched.midle
+// (under sched.lock) before sleeping; mput runs checkdead, so if this M going
+// idle means every M is idle with goroutines still alive, a genuine all-waiting
+// deadlock is reported here. Mirrors stopm/mPark (proc.go:2998).
 @(private)
 stopm :: proc() {
-	n := intrinsics.atomic_add(&sched.nidle, 1) + 1
-	if n == gomaxprocs && intrinsics.atomic_load_explicit(&sched.grunning, .Acquire) > 0 {
-		report_deadlock_if_stuck()
+	mp := getm()
+
+	sync.lock(&sched.lock)
+	// Re-check shutdown under the very lock begin_shutdown drains the idle list
+	// with. This makes shutdown liveness independent of PARK_TIMEOUT: either we
+	// list ourselves before begin_shutdown's drain (so it posts our note), or we
+	// observe shutdown here and never park. Without this check a worker that read
+	// shutdown==false in findrunnable, then parked just after the drain, would
+	// only exit via the timeout re-poll.
+	if intrinsics.atomic_load_explicit(&sched.shutdown, .Acquire) {
+		sync.unlock(&sched.lock)
+		return
 	}
-	sync.sema_wait_with_timeout(&sched.idle_sema, PARK_TIMEOUT)
-	intrinsics.atomic_add(&sched.nidle, -1)
+	mput(mp) // list self + run checkdead, both under the lock
+	sync.unlock(&sched.lock)
+
+	// The bool result (true=posted, false=timed out) is intentionally ignored:
+	// stopm re-polls findrunnable regardless of why it woke, so the re-poll, not
+	// this signal, is the source of truth.
+	sync.sema_wait_with_timeout(&mp.park, PARK_TIMEOUT)
+
+	// Delist self. If a waker already popped us (wakep/begin_shutdown), this is a
+	// no-op; if we woke on the timeout we remove ourselves. Either way stopm
+	// returns with this M off the idle list.
+	sync.lock(&sched.lock)
+	mget_specific(mp)
+	sync.unlock(&sched.lock)
 }
 
 // mcall saves the current goroutine and runs fn(gp) on the scheduler stack.
@@ -520,13 +656,16 @@ dropg :: proc() {
 @(private)
 park_m :: proc "c" (gp: ^G) {
 	context = runtime.default_context()
+	mp := getm()
 	casgstatus(gp, .Running, .Waiting)
 	dropg()
 
-	if park_unlockf != nil {
-		ok := park_unlockf(gp, park_lock)
-		park_unlockf = nil
-		park_lock = nil
+	if mp.waitunlockf != nil {
+		unlockf := mp.waitunlockf
+		lock := mp.waitlock
+		mp.waitunlockf = nil
+		mp.waitlock = nil
+		ok := unlockf(gp, lock)
 		if !ok {
 			// The unlock callback aborted the park: resume gp immediately.
 			casgstatus(gp, .Waiting, .Runnable)
@@ -741,7 +880,12 @@ runqsteal :: proc(pp: ^P, victim: ^P, steal_runnext: bool) -> ^G {
 		return gp
 	}
 	h := intrinsics.atomic_load_explicit(&pp.runqhead, .Acquire)
-	assert(t - h + n < RUNQ_SIZE, "runqsteal: runq overflow")
+	// Unconditional guard (not assert, which -disable-assert strips in release):
+	// a violated bound would silently wrap the ring and overwrite live Gs.
+	// Mirrors Go's always-on `throw` here.
+	if t - h + n >= RUNQ_SIZE {
+		panic("runqsteal: runq overflow")
+	}
 	intrinsics.atomic_store_explicit(&pp.runqtail, t + n, .Release)
 	return gp
 }
@@ -860,6 +1004,4 @@ runtime_teardown :: proc() {
 	g0 = {}
 	tls_g = nil
 	tls_m = nil
-	park_unlockf = nil
-	park_lock = nil
 }

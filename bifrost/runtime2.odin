@@ -99,8 +99,7 @@ G :: struct {
 // subset.
 //
 // The "current g/m" that Go stores in m.tls live in the package's
-// @(thread_local) tls_g/tls_m instead (see getg/getm). A `park` blocking
-// primitive for idle Ms (Go's `note`) is added alongside newm.
+// @(thread_local) tls_g/tls_m instead (see getg/getm).
 M :: struct {
 	// g0 is the scheduling goroutine: it owns a dedicated stack on which the
 	// scheduler itself (schedule, gopark, etc.) runs, separate from any user
@@ -110,6 +109,13 @@ M :: struct {
 	g0_stack: Stack,
 	// curg is the user goroutine this M is currently running, or nil.
 	curg: ^G,
+	// waitunlockf / waitlock hold the pending park unlock callback and its
+	// argument while a goroutine running on THIS M is parking: gopark sets them,
+	// park_m consults them on g0. Mirrors Go's m.waitunlockf / m.waitlock
+	// (runtime2.go). They live on the M (not package globals) because each M can
+	// have a goroutine parking concurrently with goroutines on other Ms.
+	waitunlockf: proc "c" (gp: ^G, lock: rawptr) -> bool,
+	waitlock:    rawptr,
 	// p is the P this M is bound to. In bifrost each M is pinned to one P for
 	// its lifetime (DEVIATION: Go hands Ps between Ms; bifrost balances by work
 	// stealing instead).
@@ -119,6 +125,21 @@ M :: struct {
 	// sched_return is where this M's schedule loop returns to on shutdown:
 	// run() for m0, m_thread_entry (ending the thread) for workers.
 	sched_return: Gobuf,
+	// park is this M's private wakeup note: an idle M sleeps on it in stopm and a
+	// producer posts it (after popping the M off sched.midle) to wake exactly this
+	// M. Mirrors Go's per-m `note` (m.park). Using a per-M note instead of one
+	// shared semaphore means wakeups target a specific sleeper, so permits do not
+	// pile up the way a blind shared post would. It is a counting Sema used as a
+	// near-binary note: the only way a permit lingers is the timeout/post race in
+	// stopm (the wait times out just as a waker posts), leaving at most one stray
+	// permit, which the M's next park consumes as a harmless spurious wake. m0=={}
+	// / fresh worker Ms reset it each run, so nothing accumulates across runs.
+	// DEVIATION: Go's `note` has an explicit noteclear reset; bifrost relies on
+	// the next wait consuming the stray permit instead.
+	park: sync.Sema,
+	// idle_link threads this M onto sched.midle (the LIFO idle-M stack) while it
+	// is parked. nil when running. Mirrors Go's m.schedlink usage in mput/mget.
+	idle_link: ^M,
 	// thread is the OS thread handle for a worker M (nil for m0), used to join.
 	thread: ^thread.Thread,
 	// alllink threads this M onto the global allm list.
@@ -154,20 +175,20 @@ Schedt :: struct {
 	// goidgen is the monotonically increasing goroutine id counter, bumped
 	// atomically by newg. Mirrors goidgen atomic.Uint64.
 	goidgen: u64,
-	// lock guards the global runq.
+	// lock guards the global runq AND the idle-M list (midle/nmidle).
+	// LOCK ORDER: sched.lock may be held while taking allgs_lock (checkdead does
+	// this); never the reverse. Hold sched.lock first if both are needed.
 	lock: sync.Mutex,
 	// runq is the global run queue, a fallback/overflow for the per-P runqs.
 	runq: G_Queue,
-	// idle_sema is the shared park point for idle Ms: a producer posts it to
-	// wake one M; idle Ms wait on it with a timeout (see stopm). One shared
-	// sema replaces Go's per-M notes + idle-M list.
-	idle_sema: sync.Sema,
+	// midle is a LIFO stack of idle (parked) Ms, linked through M.idle_link; an M
+	// pushes itself here in stopm and a waker pops one to signal. nmidle is its
+	// length. Both are guarded by `lock`. Mirrors Go's sched.midle / sched.nmidle.
+	midle:  ^M,
+	nmidle: i32,
 	// grunning is the number of live (non-dead) goroutines, bumped atomically by
 	// newg and goexit0. When it reaches 0 the run is complete (begin_shutdown).
 	grunning: i32,
-	// nidle counts Ms currently parked in stopm (atomic); used to detect "all
-	// Ms idle" for deadlock reporting.
-	nidle: i32,
 	// shutdown, once set (atomic), tells every M's findrunnable to return nil so
 	// the schedule loop exits.
 	shutdown: bool,
@@ -204,7 +225,9 @@ gomaxprocs: i32
 runtime_allocator: runtime.Allocator
 
 // allgs_lock guards appends to and scans of allgs, which are now performed from
-// multiple Ms (newg, deadlock reporting, teardown).
+// multiple Ms (newg, deadlock reporting, teardown). LOCK ORDER: it is the inner
+// lock — code already holding sched.lock may take it (checkdead), but code
+// holding allgs_lock must NOT take sched.lock.
 @(private)
 allgs_lock: sync.Mutex
 
