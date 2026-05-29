@@ -363,3 +363,44 @@ test_chan_buffered_closed_with_data :: proc(t: ^testing.T) {
 	testing.expectf(t, buf_results[1] == 2 && buf_oks[1], "drain 2: %d ok=%v", buf_results[1], buf_oks[1])
 	testing.expectf(t, buf_results[2] == 0 && !buf_oks[2], "post-close: %d ok=%v, want 0/false", buf_results[2], buf_oks[2])
 }
+
+// ---------------------------------------------------------------------------
+// close wakes blocked goroutines (6.5).
+// ---------------------------------------------------------------------------
+
+@(private = "file")
+close_recv_oks: int
+
+@(private = "file")
+close_recv_worker :: proc(arg: rawptr) {
+	out := 777
+	_, ok := chanrecv(tc_chan, &out, true)
+	// A close-woken receiver sees the zero value with ok=false.
+	if !ok && out == 0 {
+		close_recv_oks += 1
+	}
+}
+
+@(private = "file")
+close_worker :: proc(arg: rawptr) {
+	close_chan(tc_chan)
+}
+
+// Three receivers park on an unbuffered channel; closing it must wake all three,
+// each with the zero value and ok=false.
+@(test)
+test_chan_close_wakes_receivers :: proc(t: ^testing.T) {
+	runtime_init(1)
+	defer runtime_teardown()
+	tc_chan = make_chan(size_of(int), 0)
+	defer destroy_chan(tc_chan)
+
+	close_recv_oks = 0
+	go_(close_recv_worker) // these three run first and park on recvq
+	go_(close_recv_worker)
+	go_(close_recv_worker)
+	go_(close_worker) // then this closes and wakes them
+	run()
+
+	testing.expectf(t, close_recv_oks == 3, "woken receivers with zero/ok=false = %d, want 3", close_recv_oks)
+}

@@ -126,25 +126,68 @@ destroy_chan :: proc(c: ^Hchan, allocator := context.allocator) {
 	free(c, allocator)
 }
 
-// close_chan marks the channel closed. Shell until Phase 6.5: it sets the closed
-// flag under the lock and rejects nil/double close, but does NOT yet wake
-// goroutines already parked on sendq/recvq. Now that send/recv (6.3) exist a
-// goroutine CAN be queued when close runs, and such a waiter is currently
-// stranded (surfaced as a deadlock by checkdead, not silently lost). Until 6.5
-// lands, do not close a channel that still has live waiters. Mirrors closechan
-// (chan.go).
+// close_chan marks the channel closed and wakes everyone blocked on it: each
+// parked receiver gets the zero value with ok=false, and each parked sender
+// resumes to panic ("send on closed channel"). Buffered data already in the ring
+// survives — a later receive drains it before seeing closed (chanrecv). Panics
+// on a nil or already-closed channel. Mirrors closechan (chan.go).
+//
+// The blocked goroutines are collected under c.lock but readied only AFTER it is
+// released: goready takes scheduler locks, and nesting those under c.lock would
+// invite lock-order trouble (and is what Go does too).
 close_chan :: proc(c: ^Hchan) {
 	if c == nil {
 		panic("close of nil channel")
 	}
+
 	sync.lock(&c.lock)
-	defer sync.unlock(&c.lock)
 	if c.closed != 0 {
+		sync.unlock(&c.lock)
 		panic("close of closed channel")
 	}
 	c.closed = 1
-	// TODO(phase 6.5): release every sudog on sendq (each panics on resume) and
-	// recvq (each receives the zero value with ok=false), then goready them.
+
+	// Collect blocked goroutines into a temporary list threaded through schedlink
+	// (parked goroutines are on no run queue, so schedlink is free to borrow).
+	to_ready: ^G
+
+	// Receivers: deliver the zero value, ok=false (success stays false).
+	for {
+		sg := waitq_dequeue(&c.recvq)
+		if sg == nil {
+			break
+		}
+		if sg.elem != nil {
+			mem.zero(sg.elem, int(c.elem_size))
+			sg.elem = nil
+		}
+		sg.success = false
+		gp := sg.g
+		gp.schedlink = to_ready
+		to_ready = gp
+	}
+
+	// Senders: each panics on resume (it reads success=false in chansend).
+	for {
+		sg := waitq_dequeue(&c.sendq)
+		if sg == nil {
+			break
+		}
+		sg.elem = nil
+		sg.success = false
+		gp := sg.g
+		gp.schedlink = to_ready
+		to_ready = gp
+	}
+
+	sync.unlock(&c.lock)
+
+	for to_ready != nil {
+		gp := to_ready
+		to_ready = gp.schedlink
+		gp.schedlink = nil
+		goready(gp)
+	}
 }
 
 // ---------------------------------------------------------------------------

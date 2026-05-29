@@ -319,10 +319,13 @@
       buffered branch does the queue-full rotate when a sender is parked. Tests:
       FIFO fill/drain, blocking-on-full, closed-with-buffered-data. DEVIATION:
       no `typedmemclr` of the consumed slot (Go does it for GC; bifrost has none).
-- [ ] **6.5 `close_chan`.**
-      Wake all `sendq` waiters (they panic on resume: send on closed channel)
-      and all `recvq` waiters (zero value, `ok=false`). Panic on close of a
-      closed/nil channel. See `chan.go` `closechan`.
+- [x] **6.5 `close_chan`.**
+      Drains `recvq` (zero each receiver's `ep`, `success=false`) and `sendq`
+      (`success=false`) into a temp list under `c.lock`, then `goready`s them all
+      after unlock — receivers return zero/`ok=false`, senders panic on resume.
+      Buffered data survives close (drained first). Panics on nil/double close.
+      Closes the strand-on-close gap the 6.3 review flagged. Tested: close wakes
+      three parked receivers. Mirrors `closechan` (`chan.go`).
 - [ ] **6.6 Typed `Chan(T)` wrapper.**
       `Chan :: struct($T)` over `^Hchan`; `chan_make($T, cap)`,
       `chan_send(ch, v)`, `chan_recv(ch) -> (T, bool)`, `chan_close(ch)` —
