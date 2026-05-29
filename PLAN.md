@@ -400,8 +400,17 @@
       released (single-M with `gosched`), uncontended loop; 4-thread integration
       stresses 5000 acquisitions on one Mutex plus 2×2000 on two independent
       Mutexes (cross-bucket isolation), looped 10× clean.
-- [ ] **8.3 `WaitGroup`.**
-      Atomic counter + sema. See `src/sync/waitgroup.go`.
+- [x] **8.3 `WaitGroup`.**
+      State packed in one `u64` (hi 32 = i32 counter, lo 32 = u32 waiters), every
+      transition is a CAS on the full word — closes the classic lost-wakeup race
+      between "add brings counter to 0" and "wait registers a waiter" atomically
+      without a nested lock. `waitgroup_add(wg, delta)` drains the waiters via
+      `sema_release` on the 0-transition; `waitgroup_done` is `add(-1)`;
+      `waitgroup_wait` parks on the sema. Panics on negative counter and on
+      Wait/Add reuse caught at the post-wake state load (best effort, like
+      `sync.WaitGroup`). Tests: zero-counter Wait returns immediately,
+      Add/Done/Wait, single Done wakes many parked waiters. Integration: 5000
+      workers fan-in on 4 threads + a 64-waiter wake-all, looped 10× clean.
 - [ ] **8.4 `Once`.**
       Atomic done flag + Mutex. See `src/sync/once.go`.
 - [ ] **8.5 `RWMutex` (optional).**
