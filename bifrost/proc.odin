@@ -3,6 +3,7 @@ package bifrost
 import "base:intrinsics"
 import "base:runtime"
 import "core:fmt"
+import "core:sync"
 
 // Phase 4: a single-M, single-P cooperative scheduler. One OS thread (m0) runs
 // goroutines on its P (allp[0]); goroutines yield voluntarily via gosched, park
@@ -409,96 +410,169 @@ next_goid :: proc() -> u64 {
 // Run queues
 // ---------------------------------------------------------------------------
 
-// runqput enqueues gp on P's run queue. With sysmon absent (HAVE_SYSMON ==
-// false) the `next` (runnext) fast path is disabled to avoid starvation; the
-// runnext logic is kept, gated, so Phase 10 can enable it. Mirrors runqput
-// (proc.go:7508).
-//
-// DEVIATION: single-M, so plain loads/stores replace Go's atomic
-// load-acquire/store-release ring operations; Phase 5 reintroduces atomics for
-// the multi-M lock-free queue.
+// The per-P local run queue is a lock-free ring (Go's design): the owner P
+// pushes (runqput) and pops (runqget); any P may steal half via runqgrab. The
+// owner writes runqtail with store-release; consumers load runqhead/runqtail
+// with acquire and commit a consume by CAS'ing runqhead. runnext stays disabled
+// while !HAVE_SYSMON (see runqput), so its CAS paths are present but inert.
+
+// runqput enqueues gp on P's run queue. Mirrors runqput (proc.go:7508).
 @(private)
 runqput :: proc(pp: ^P, gp: ^G, next: bool) {
 	gp := gp
 	next := next
 	when !HAVE_SYSMON {
-		next = false
+		next = false // runnext needs sysmon to avoid starvation (Go's guard)
 	}
 
 	if next {
-		old := pp.runnext
-		pp.runnext = gp
-		if old == nil {
-			return
+		for {
+			old := intrinsics.atomic_load_explicit(&pp.runnext, .Acquire)
+			_, ok := intrinsics.atomic_compare_exchange_strong_explicit(
+				&pp.runnext, old, gp, .Acq_Rel, .Acquire,
+			)
+			if ok {
+				if old == nil {
+					return
+				}
+				gp = old // kick the old runnext into the regular queue
+				break
+			}
 		}
-		gp = old // kick the old runnext into the regular queue
 	}
 
-	h := pp.runqhead
-	t := pp.runqtail
-	if t - h < RUNQ_SIZE {
-		pp.runq[int(t % RUNQ_SIZE)] = gp
-		pp.runqtail = t + 1
-		return
+	for {
+		h := intrinsics.atomic_load_explicit(&pp.runqhead, .Acquire) // sync with consumers
+		t := pp.runqtail
+		if t - h < RUNQ_SIZE {
+			pp.runq[int(t % RUNQ_SIZE)] = gp
+			intrinsics.atomic_store_explicit(&pp.runqtail, t + 1, .Release) // publish
+			return
+		}
+		if runqputslow(pp, gp, h, t) {
+			return
+		}
+		// the queue was full but a steal may have freed space; retry
 	}
-	runqputslow(pp, gp, h, t)
 }
 
 // runqputslow moves half of P's full local run queue, plus gp, to the global
-// queue, keeping the local queue from monopolising runnable work. Mirrors
-// runqputslow (proc.go:7554).
+// queue. Returns false if a concurrent steal advanced runqhead (caller retries).
+// Mirrors runqputslow (proc.go:7554).
 @(private)
-runqputslow :: proc(pp: ^P, gp: ^G, h, t: u32) {
-	// Only ever called from runqput when the local queue is full; the batch
-	// math assumes exactly that. Mirrors Go's "queue is not full" throw.
-	assert(t - h == RUNQ_SIZE, "runqputslow: local run queue is not full")
+runqputslow :: proc(pp: ^P, gp: ^G, h, t: u32) -> bool {
 	n := (t - h) / 2
+	assert(n == RUNQ_SIZE / 2, "runqputslow: local run queue is not full")
 
-	head: ^G
-	tail: ^G
+	// Collect pointers first; the Gs still belong to the ring until the CAS
+	// below commits the consume, so we must not touch their schedlink yet.
+	batch: [RUNQ_SIZE / 2 + 1]^G
 	for i in 0 ..< n {
-		gi := pp.runq[int((h + i) % RUNQ_SIZE)]
-		if head == nil {
-			head = gi
-		} else {
-			tail.schedlink = gi
-		}
-		tail = gi
+		batch[i] = pp.runq[int((h + i) % RUNQ_SIZE)]
 	}
-	// Append gp to the batch.
-	if head == nil {
-		head = gp
-	} else {
-		tail.schedlink = gp
+	if _, ok := intrinsics.atomic_compare_exchange_strong_explicit(
+		&pp.runqhead, h, h + n, .Acq_Rel, .Acquire,
+	); !ok {
+		return false
 	}
-	tail = gp
-	tail.schedlink = nil
 
-	pp.runqhead = h + n
-	globrunqputbatch(head, tail, i32(n + 1))
+	batch[n] = gp
+	for i in 0 ..< n {
+		batch[i].schedlink = batch[i + 1]
+	}
+	batch[n].schedlink = nil
+	globrunqputbatch(batch[0], batch[n], i32(n + 1))
+	return true
 }
 
 // runqget pops the next goroutine from P's local run queue (runnext first, then
-// the ring). Mirrors runqget (proc.go:7628).
+// the ring). Called by the owner P. Mirrors runqget (proc.go:7628).
 @(private)
 runqget :: proc(pp: ^P) -> ^G {
-	if pp.runnext != nil {
-		gp := pp.runnext
-		pp.runnext = nil
-		return gp
+	if next := intrinsics.atomic_load_explicit(&pp.runnext, .Acquire); next != nil {
+		// Only the owner sets runnext to non-nil, so a lost CAS means a stealer
+		// took it; no retry needed.
+		if _, ok := intrinsics.atomic_compare_exchange_strong_explicit(
+			&pp.runnext, next, nil, .Acq_Rel, .Acquire,
+		); ok {
+			return next
+		}
 	}
-	h := pp.runqhead
+	for {
+		h := intrinsics.atomic_load_explicit(&pp.runqhead, .Acquire)
+		t := pp.runqtail
+		if t == h {
+			return nil
+		}
+		gp := pp.runq[int(h % RUNQ_SIZE)]
+		if _, ok := intrinsics.atomic_compare_exchange_strong_explicit(
+			&pp.runqhead, h, h + 1, .Acq_Rel, .Acquire,
+		); ok {
+			return gp
+		}
+	}
+}
+
+// runqgrab steals up to half of pp's queue into dst[dst_head..], returning the
+// count grabbed. Mirrors runqgrab (proc.go:7692). steal_runnext is unused while
+// !HAVE_SYSMON (runnext is always nil) but kept for fidelity.
+@(private)
+runqgrab :: proc(pp: ^P, dst: ^[RUNQ_SIZE]^G, dst_head: u32, steal_runnext: bool) -> u32 {
+	for {
+		h := intrinsics.atomic_load_explicit(&pp.runqhead, .Acquire)
+		t := intrinsics.atomic_load_explicit(&pp.runqtail, .Acquire)
+		n := t - h
+		n = n - n / 2
+		if n == 0 {
+			if steal_runnext {
+				if next := intrinsics.atomic_load_explicit(&pp.runnext, .Acquire); next != nil {
+					if _, ok := intrinsics.atomic_compare_exchange_strong_explicit(
+						&pp.runnext, next, nil, .Acq_Rel, .Acquire,
+					); !ok {
+						continue
+					}
+					dst[dst_head % RUNQ_SIZE] = next
+					return 1
+				}
+			}
+			return 0
+		}
+		if n > RUNQ_SIZE / 2 { // inconsistent h/t snapshot; retry
+			continue
+		}
+		for i in 0 ..< n {
+			dst[int((dst_head + i) % RUNQ_SIZE)] = pp.runq[int((h + i) % RUNQ_SIZE)]
+		}
+		if _, ok := intrinsics.atomic_compare_exchange_strong_explicit(
+			&pp.runqhead, h, h + n, .Acq_Rel, .Acquire,
+		); ok {
+			return n
+		}
+	}
+}
+
+// runqsteal steals half of victim's queue into pp's queue and returns one of the
+// stolen goroutines (or nil). Mirrors runqsteal (proc.go:7760).
+@(private)
+runqsteal :: proc(pp: ^P, victim: ^P, steal_runnext: bool) -> ^G {
 	t := pp.runqtail
-	if t == h {
+	n := runqgrab(victim, &pp.runq, t, steal_runnext)
+	if n == 0 {
 		return nil
 	}
-	gp := pp.runq[int(h % RUNQ_SIZE)]
-	pp.runqhead = h + 1
+	n -= 1
+	gp := pp.runq[int((t + n) % RUNQ_SIZE)]
+	if n == 0 {
+		return gp
+	}
+	h := intrinsics.atomic_load_explicit(&pp.runqhead, .Acquire)
+	assert(t - h + n < RUNQ_SIZE, "runqsteal: runq overflow")
+	intrinsics.atomic_store_explicit(&pp.runqtail, t + n, .Release)
 	return gp
 }
 
-// globrunqput appends one goroutine to the global run queue. Mirrors
-// globrunqput (proc.go:7279). (No lock yet: single-M. Phase 5 adds sched.lock.)
+// globrunqput appends one goroutine to the global run queue (under sched.lock).
+// Mirrors globrunqput (proc.go:7279).
 @(private)
 globrunqput :: proc(gp: ^G) {
 	gp.schedlink = nil
@@ -506,12 +580,17 @@ globrunqput :: proc(gp: ^G) {
 }
 
 // globrunqputbatch appends a pre-linked chain [head..tail] of n goroutines to
-// the global run queue. Mirrors globrunqputbatch (proc.go:7302).
+// the global run queue under sched.lock. Mirrors globrunqputbatch (proc.go:7302).
+//
+// DEVIATION: Go requires the caller to already hold sched.lock; bifrost's
+// global-queue ops are self-locking for simplicity (no nested lock sites).
 @(private)
 globrunqputbatch :: proc(head, tail: ^G, n: i32) {
 	if head == nil {
 		return
 	}
+	sync.lock(&sched.lock)
+	defer sync.unlock(&sched.lock)
 	if sched.runq.tail == nil {
 		sched.runq.head = head
 	} else {
@@ -521,10 +600,12 @@ globrunqputbatch :: proc(head, tail: ^G, n: i32) {
 	sched.runq.n += n
 }
 
-// globrunqget pops one goroutine from the global run queue. Mirrors
-// globrunqget (proc.go:7311).
+// globrunqget pops one goroutine from the global run queue (under sched.lock).
+// Mirrors globrunqget (proc.go:7311).
 @(private)
 globrunqget :: proc() -> ^G {
+	sync.lock(&sched.lock)
+	defer sync.unlock(&sched.lock)
 	gp := sched.runq.head
 	if gp == nil {
 		return nil
