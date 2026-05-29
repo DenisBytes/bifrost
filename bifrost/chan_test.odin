@@ -212,3 +212,37 @@ test_chan_recv_from_closed_empty :: proc(t: ^testing.T) {
 	testing.expectf(t, tc_got == 0, "recv on closed empty should zero ep, got %d", tc_got)
 	testing.expect(t, !tc_ok, "recv ok on closed empty should be false")
 }
+
+// Zero-size element (a `chan struct{}` signal channel): the byte copy is a no-op,
+// so this exercises that the nil/size guards keep the pure-synchronisation
+// rendezvous working with nothing to transfer.
+@(private = "file")
+sig_received: bool
+
+@(private = "file")
+sig_sender :: proc(arg: rawptr) {
+	dummy: struct {}
+	chansend(tc_chan, &dummy, true)
+}
+
+@(private = "file")
+sig_receiver :: proc(arg: rawptr) {
+	dummy: struct {}
+	chanrecv(tc_chan, &dummy, true)
+	sig_received = true
+}
+
+@(test)
+test_chan_zero_size_signal :: proc(t: ^testing.T) {
+	runtime_init(1)
+	defer runtime_teardown()
+	tc_chan = make_chan(0, 0)
+	defer destroy_chan(tc_chan)
+
+	sig_received = false
+	go_(sig_sender)
+	go_(sig_receiver)
+	run()
+
+	testing.expect(t, sig_received, "zero-size signal rendezvous did not complete")
+}

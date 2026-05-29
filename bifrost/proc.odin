@@ -1007,6 +1007,12 @@ acquire_sudog :: proc() -> ^Sudog {
 	if s.elem != nil {
 		panic("acquire_sudog: cached sudog has non-nil elem")
 	}
+	// release_sudog does not clear success, so a recycled sudog still carries the
+	// previous op's result. Reset it here to a clean false: every wake path must
+	// set success=true on a successful handoff, so a path that forgets (e.g. a
+	// future close that misses a waiter) fails loud-and-safe — a spurious "closed"
+	// — instead of silently reporting a stale success with a wrong value.
+	s.success = false
 	return s
 }
 

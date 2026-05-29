@@ -126,10 +126,13 @@ destroy_chan :: proc(c: ^Hchan, allocator := context.allocator) {
 	free(c, allocator)
 }
 
-// close_chan marks the channel closed. Shell for Phase 6.2: it sets the closed
-// flag under the lock and rejects nil/double close. Waking blocked senders and
-// receivers is Phase 6.5 — until send/recv (6.3/6.4) land, no goroutine can be
-// queued, so there is nothing to wake yet. Mirrors closechan (chan.go).
+// close_chan marks the channel closed. Shell until Phase 6.5: it sets the closed
+// flag under the lock and rejects nil/double close, but does NOT yet wake
+// goroutines already parked on sendq/recvq. Now that send/recv (6.3) exist a
+// goroutine CAN be queued when close runs, and such a waiter is currently
+// stranded (surfaced as a deadlock by checkdead, not silently lost). Until 6.5
+// lands, do not close a channel that still has live waiters. Mirrors closechan
+// (chan.go).
 close_chan :: proc(c: ^Hchan) {
 	if c == nil {
 		panic("close of nil channel")
