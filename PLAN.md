@@ -326,11 +326,11 @@
       Buffered data survives close (drained first). Panics on nil/double close.
       Closes the strand-on-close gap the 6.3 review flagged. Tested: close wakes
       three parked receivers. Mirrors `closechan` (`chan.go`).
-- [ ] **6.6 Typed `Chan(T)` wrapper.**
-      `Chan :: struct($T)` over `^Hchan`; `chan_make($T, cap)`,
-      `chan_send(ch, v)`, `chan_recv(ch) -> (T, bool)`, `chan_close(ch)` —
-      thin parametric-polymorphism wrappers that `size_of(T)` into the untyped
-      core and copy via `&v`.
+- [x] **6.6 Typed `Chan(T)` wrapper.**
+      `Chan :: struct($T)` over `^Hchan`; `chan_make($T, cap)`, `chan_destroy`,
+      `chan_send(ch, v)`, `chan_recv(ch) -> (T, bool)`, `chan_close(ch)` — thin
+      parametric-polymorphism wrappers that `size_of(T)` into the untyped core
+      and copy via `&v`. Tested typed unbuffered send/recv and buffered+close.
 - [ ] **6.7 Acceptance: worker pool + unbuffered ping-pong.**
       Producer pushes 10k ints into a buffered chan (cap 16); N consumer
       goroutines drain; sum matches expected. Plus an unbuffered ping-pong

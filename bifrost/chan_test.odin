@@ -404,3 +404,71 @@ test_chan_close_wakes_receivers :: proc(t: ^testing.T) {
 
 	testing.expectf(t, close_recv_oks == 3, "woken receivers with zero/ok=false = %d, want 3", close_recv_oks)
 }
+
+// ---------------------------------------------------------------------------
+// Typed Chan(T) wrapper (6.6).
+// ---------------------------------------------------------------------------
+
+@(private = "file")
+tch: Chan(int)
+
+@(private = "file")
+tch_vals: [3]int
+
+@(private = "file")
+tch_oks: [3]bool
+
+@(private = "file")
+tch_send42 :: proc(arg: rawptr) {
+	chan_send(tch, 42)
+}
+
+@(private = "file")
+tch_recv0 :: proc(arg: rawptr) {
+	tch_vals[0], tch_oks[0] = chan_recv(tch)
+}
+
+@(test)
+test_typed_chan_send_recv :: proc(t: ^testing.T) {
+	runtime_init(1)
+	defer runtime_teardown()
+	tch = chan_make(int, 0)
+	defer chan_destroy(tch)
+
+	tch_vals = {}
+	tch_oks = {}
+	go_(tch_send42)
+	go_(tch_recv0)
+	run()
+
+	testing.expectf(t, tch_vals[0] == 42 && tch_oks[0], "typed recv got %d ok=%v, want 42/true", tch_vals[0], tch_oks[0])
+}
+
+// One worker fills a typed buffered channel, closes it, then drains: the two
+// values come back ok=true and the post-close receive is (0, false).
+@(private = "file")
+tch_buf_worker :: proc(arg: rawptr) {
+	chan_send(tch, 7)
+	chan_send(tch, 8)
+	chan_close(tch)
+	for i in 0 ..< 3 {
+		tch_vals[i], tch_oks[i] = chan_recv(tch)
+	}
+}
+
+@(test)
+test_typed_chan_buffered_close :: proc(t: ^testing.T) {
+	runtime_init(1)
+	defer runtime_teardown()
+	tch = chan_make(int, 2)
+	defer chan_destroy(tch)
+
+	tch_vals = {}
+	tch_oks = {}
+	go_(tch_buf_worker)
+	run()
+
+	testing.expectf(t, tch_vals[0] == 7 && tch_oks[0], "drain 1: %d ok=%v", tch_vals[0], tch_oks[0])
+	testing.expectf(t, tch_vals[1] == 8 && tch_oks[1], "drain 2: %d ok=%v", tch_vals[1], tch_oks[1])
+	testing.expectf(t, tch_vals[2] == 0 && !tch_oks[2], "post-close: %d ok=%v, want 0/false", tch_vals[2], tch_oks[2])
+}

@@ -415,3 +415,49 @@ chanrecv :: proc(c: ^Hchan, ep: rawptr, block: bool) -> (selected: bool, receive
 	release_sudog(mysg)
 	return true, success
 }
+
+// ---------------------------------------------------------------------------
+// Typed wrapper (Phase 6.6)
+// ---------------------------------------------------------------------------
+
+// Chan(T) is a type-safe handle over the untyped Hchan core: it carries the
+// element type in the type system so chan_send/chan_recv take and return T
+// directly instead of rawptr + elem_size. It is a thin value (just the pointer),
+// cheap to copy and pass to goroutines. The untyped chansend/chanrecv remain the
+// substrate, mirroring Go's compiler/runtime split (typed `chan T` over the
+// untyped runtime hchan).
+Chan :: struct($T: typeid) {
+	c: ^Hchan,
+}
+
+// chan_make creates a Chan(T) with the given buffer capacity (0 = unbuffered),
+// sizing the element from T. Pair with chan_destroy.
+chan_make :: proc($T: typeid, capacity := 0, allocator := context.allocator) -> Chan(T) {
+	return Chan(T){make_chan(size_of(T), capacity, allocator)}
+}
+
+// chan_destroy frees a Chan(T). The caller must ensure no goroutine is still
+// blocked on it (close it and let receivers drain first).
+chan_destroy :: proc(ch: Chan($T), allocator := context.allocator) {
+	destroy_chan(ch.c, allocator)
+}
+
+// chan_send sends v on ch, blocking until a receiver takes it (or buffer room
+// exists). Panics if ch is closed.
+chan_send :: proc(ch: Chan($T), v: T) {
+	v := v // a local whose address is stable for the byte copy
+	chansend(ch.c, &v, true)
+}
+
+// chan_recv receives the next value from ch. ok is false when the channel is
+// closed and drained, in which case value is the zero value of T.
+chan_recv :: proc(ch: Chan($T)) -> (value: T, ok: bool) {
+	_, ok = chanrecv(ch.c, &value, true)
+	return
+}
+
+// chan_close closes ch: parked receivers get (zero, false) and parked senders
+// panic. Panics on a nil or already-closed channel.
+chan_close :: proc(ch: Chan($T)) {
+	close_chan(ch.c)
+}
