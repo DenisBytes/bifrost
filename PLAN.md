@@ -183,27 +183,43 @@
 > Now we run on `gomaxprocs` OS threads. This is where atomics, memory
 > ordering, and lock-free queues start to matter.
 
-- [ ] **5.1 Spin up M0 and bind it to P0.**
-      `m0` is the main OS thread. Implement `acquirep` / `releasep`.
-      See `proc.go` of same name.
-- [ ] **5.2 `newm(fn, p)`.**
-      Allocate an `m`, allocate a `g0` with its own stack, start an
-      OS thread (Odin `core:thread.create`) whose entry calls `mstart`.
-      See `proc.go` `newm`, `mstart`, `mstart1`.
-- [ ] **5.3 `startTheWorld` minimal.**
-      For each idle P, ensure there is an M to run it. Park extra Ms
-      on `m.park` semaphore. See `proc.go` `startm`, `wakep`.
-- [ ] **5.4 Work stealing in `findrunnable`.**
-      Order: local runnext → local runq → global runq → poll netpoll
-      (later) → steal from a random other P (half its queue). See
-      `proc.go` `findRunnable`, `runqsteal`, `runqgrab`.
-- [ ] **5.5 M parking / unparking.**
-      When `findrunnable` finds nothing, M parks on its semaphore.
-      `wakep` / `startm` unparks. See `proc.go` `stopm`, `startm`.
-- [ ] **5.6 Stress test.**
-      4 Ms, 4 Ps, 100k goroutines doing `Gosched` in a loop and a
-      shared atomic counter. Acceptance: no race, no deadlock, all
-      goroutines terminate, counter == expected.
+> SCOPE (agreed with user): a *correct subset* — atomic run queues + work
+> stealing + semaphore parking with a timeout backstop + best-effort wakeups.
+> NO spinning-M "delicate dance" and NO sysmon (deferred). Threads lifecycle is
+> *self-contained run()*: it starts the workers, runs to completion, then joins
+> them. DEVIATION: a fixed M-per-P pool (one M pinned per P, created upfront)
+> instead of Go's on-demand Ms + P handoff; load is balanced by stealing.
+
+- [x] **5.1 acquirep/releasep + thread-local getg/getm.** (commit `5cd6fcb`)
+      `@(thread_local) tls_g/tls_m` replace the single current_g; `acquirep`/
+      `releasep` bind a P to an M. m0 binds P0 in scheduler_start.
+- [x] **5.2 `newm` + real OS threads.** (`proc.odin`)
+      `newm(pp)` allocates an M, its g0 + g0 stack, and starts an OS thread via
+      `core:thread.create_and_start_with_data` whose entry (`m_thread_entry` →
+      `mstart_run`) installs tls and runs `schedule` on the g0 stack. Mirrors
+      newm/mstart0/mstart1.
+- [x] **5.3 run() starts/stops the worker pool.**
+      DEVIATION from Go's startTheWorld/startm: `run()` pre-creates one worker M
+      per P beyond P0, runs m0's own schedule loop, and on shutdown joins +
+      destroys the workers. Termination is driven by `sched.grunning` (atomic
+      live-goroutine count) → `begin_shutdown` posts all Ms.
+- [x] **5.4 Work stealing in `findrunnable`.** (`proc.odin`)
+      Order: local runq → global runq → steal half from a random other P
+      (`runqsteal`/`runqgrab`, a few rounds via a per-thread `fastrand`).
+      runnext stays disabled (HAVE_SYSMON false), so its steal path is inert.
+- [x] **5.5 M parking / unparking.** (`proc.odin`)
+      Idle Ms park in `stopm` on a shared `sched.idle_sema` with `PARK_TIMEOUT`;
+      producers (`go_`/`ready`/`gosched_m`) `wakep`. DEVIATION: the timeout
+      backstop makes correctness independent of precise wakeups, replacing Go's
+      spinning-M handshake. Deadlock is reported when all Ms go idle with live
+      goroutines (`report_deadlock_if_stuck`, status-based like checkdead).
+- [x] **5.6 Stress tests.** (`integration_sched_test.odin`)
+      4-thread suite: 20k-goroutine parallel atomic counter (== expected,
+      ≥2 Ms used), work-stealing test (children confined to one P spread across
+      Ms), cross-M gopark/goready, repeated init/run/teardown — all leak-clean,
+      run 20× in a loop with no race/deadlock. (Used 20k not 100k: each
+      goroutine is a distinct mmap'd stack, so 100k would hit the default
+      vm.max_map_count; documented.) `examples/parallel` runs on 4 OS threads.
 
 ---
 

@@ -1,6 +1,6 @@
 PACKAGES = bifrost
 
-EXAMPLES = hello spawn pingpong
+EXAMPLES = hello spawn pingpong parallel
 
 BIN = bin
 

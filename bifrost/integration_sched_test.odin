@@ -153,6 +153,58 @@ test_integration_work_stealing :: proc(t: ^testing.T) {
 	testing.expectf(t, ms >= 2, "children ran on only %d M(s); work stealing should spread them", ms)
 }
 
+// gopark on one M, goready from another: a parked goroutine must be resumable
+// by a goroutine running on a different OS thread.
+@(private = "file")
+xm_parked: ^G
+
+@(private = "file")
+xm_resumed: bool
+
+@(private = "file")
+xm_readied: bool
+
+@(private = "file")
+xm_parker :: proc(arg: rawptr) {
+	intrinsics.atomic_store(&xm_parked, getg())
+	gopark(nil, nil, .None)
+	xm_resumed = true // read after join, so a plain store is fine
+}
+
+@(private = "file")
+xm_readier :: proc(arg: rawptr) {
+	// Wait until the parker exists and has actually reached _Gwaiting, then ready
+	// it. Spinning via gosched keeps this goroutine runnable (so the deadlock
+	// detector never sees all Ms idle).
+	for {
+		gp := intrinsics.atomic_load(&xm_parked)
+		if gp != nil && g_status(gp) == .Waiting {
+			goready(gp)
+			break
+		}
+		gosched()
+	}
+	xm_readied = true
+}
+
+@(test)
+test_integration_park_ready_cross_m :: proc(t: ^testing.T) {
+	if integration_skip(t) do return
+
+	runtime_init(4)
+	defer runtime_teardown()
+
+	xm_parked = nil
+	xm_resumed = false
+	xm_readied = false
+	go_(xm_parker)
+	go_(xm_readier)
+	run()
+
+	testing.expect(t, xm_readied, "readier did not run")
+	testing.expect(t, xm_resumed, "parked goroutine did not resume after cross-M goready")
+}
+
 // Repeated init/spawn/run/teardown cycles on multiple threads must stay
 // leak-clean and not deadlock (exercises thread create/join each round).
 @(test)
