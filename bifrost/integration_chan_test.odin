@@ -121,3 +121,88 @@ test_integration_chan_ping_pong :: proc(t: ^testing.T) {
 	testing.expectf(t, pp_rounds == PP_K, "rounds = %d, want %d", pp_rounds, PP_K)
 	testing.expectf(t, live_goroutines() == 0, "live goroutines = %d, want 0", live_goroutines())
 }
+
+@(private = "file")
+SEL_N :: 2000
+
+@(private = "file")
+sel_c1: ^Hchan
+
+@(private = "file")
+sel_c2: ^Hchan
+
+@(private = "file")
+sel_sum: i64
+
+@(private = "file")
+sel_count: i64
+
+@(private = "file")
+sel_prod1 :: proc(arg: rawptr) {
+	for i in 1 ..= SEL_N {
+		v := i
+		chansend(sel_c1, &v, true)
+	}
+	close_chan(sel_c1)
+}
+
+@(private = "file")
+sel_prod2 :: proc(arg: rawptr) {
+	for i in 1 ..= SEL_N {
+		v := i
+		chansend(sel_c2, &v, true)
+	}
+	close_chan(sel_c2)
+}
+
+// Each consumer multiplexes both channels with select, disabling a case (nil
+// channel) once it closes, until both are drained — the idiomatic Go fan-in.
+@(private = "file")
+sel_consumer :: proc(arg: rawptr) {
+	o1, o2: int
+	ops := [2]Select_Op{{c = sel_c1, elem = &o1, dir = .Recv}, {c = sel_c2, elem = &o2, dir = .Recv}}
+	for ops[0].c != nil || ops[1].c != nil {
+		chosen, ok := select_(ops[:], true)
+		if !ok {
+			ops[chosen].c = nil // closed and drained: drop this case
+			continue
+		}
+		v := o1
+		if chosen == 1 {
+			v = o2
+		}
+		intrinsics.atomic_add(&sel_sum, i64(v))
+		intrinsics.atomic_add(&sel_count, 1)
+	}
+}
+
+// Cross-M select fan-in: two producers stream into two channels and close them;
+// three consumers select-multiplex both across 4 OS threads. This drives select
+// parking/waking cross-thread, the loser-sudog dequeue (each parked consumer is
+// queued on both channels), and close waking a parked selector — all under load.
+@(test)
+test_integration_select_fan_in :: proc(t: ^testing.T) {
+	if integration_skip(t) do return
+
+	runtime_init(4)
+	defer runtime_teardown()
+	sel_c1 = make_chan(size_of(int), 8)
+	defer destroy_chan(sel_c1)
+	sel_c2 = make_chan(size_of(int), 8)
+	defer destroy_chan(sel_c2)
+
+	sel_sum = 0
+	sel_count = 0
+	go_(sel_prod1)
+	go_(sel_prod2)
+	for _ in 0 ..< 3 {
+		go_(sel_consumer)
+	}
+	run()
+
+	want_count := i64(2 * SEL_N)
+	per_producer := i64(SEL_N) * i64(SEL_N + 1) / 2
+	testing.expectf(t, sel_count == want_count, "received %d, want %d", sel_count, want_count)
+	testing.expectf(t, sel_sum == 2 * per_producer, "sum = %d, want %d", sel_sum, 2 * per_producer)
+	testing.expectf(t, live_goroutines() == 0, "live goroutines = %d, want 0", live_goroutines())
+}

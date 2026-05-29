@@ -1032,6 +1032,9 @@ release_sudog :: proc(s: ^Sudog) {
 	if s.next != nil || s.prev != nil {
 		panic("release_sudog: sudog still linked in a waitq")
 	}
+	if s.waitlink != nil {
+		panic("release_sudog: sudog still on a g.waiting list")
+	}
 	if s.c != nil {
 		panic("release_sudog: sudog with non-nil c")
 	}

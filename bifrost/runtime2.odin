@@ -87,8 +87,18 @@ G :: struct {
 	// waitreason explains a _Gwaiting state for deadlock dumps.
 	waitreason: Wait_Reason,
 	// param is a scratch pointer used to hand a value to a goroutine as it is
-	// resumed (e.g. the completed sudog of a channel op). Mirrors g.param.
+	// resumed: a channel op wakes a blocked goroutine and sets param to the
+	// completed Sudog. Plain send/recv ignore it (they read their own sudog);
+	// select reads it to learn which case fired. Mirrors g.param.
 	param: rawptr,
+	// waiting is the head of the Sudog list this goroutine is blocked on while in
+	// a select (one Sudog per case, linked by Sudog.waitlink, in lock order); nil
+	// otherwise. Mirrors g.waiting.
+	waiting: ^Sudog,
+	// select_done is the select wake-race flag (atomic): when a select is parked
+	// on several channels, the first waker to CAS this 0->1 wins the right to
+	// resume the goroutine; others skip its sudog. Mirrors g.selectDone.
+	select_done: u32,
 	// start_fn / start_arg hold the goroutine's entry function and its single
 	// argument, read by the goexit_entry trampoline on first run.
 	// DEVIATION: Go encodes the start function and arguments on the new
@@ -113,6 +123,10 @@ Sudog :: struct {
 	// through the central pool list (sched.sudogcache).
 	next: ^Sudog,
 	prev: ^Sudog,
+	// waitlink threads this Sudog onto its goroutine's G.waiting list (the set of
+	// channels a single select is blocked on), in lock order. Distinct from
+	// next/prev, which thread it onto one channel's Waitq. Mirrors sudog.waitlink.
+	waitlink: ^Sudog,
 	// elem points at the data element for the channel op: the value to send, or
 	// where to receive into. It may point into the parked goroutine's own stack —
 	// the synchronous "direct send" handoff copies through it. Mirrors sudog.elem.

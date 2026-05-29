@@ -342,19 +342,34 @@
 
 ## Phase 7 — `select`
 
-- [ ] **7.1 Concept lesson: the two-phase locking algorithm.**
-      Why `select` must lock all involved channels in address order
-      to avoid deadlock. Read `select.go:selectgo` carefully.
-- [ ] **7.2 `scase` and `selectgo` skeleton.**
-      Build the `scase` array, randomize a poll order, lock all
-      channels in address order. See `select.go:20` and `selectgo`.
-- [ ] **7.3 Pass 1: try every case non-blocking.**
-      If any case is ready, execute it, unlock all, return its index.
-- [ ] **7.4 Pass 2: enqueue sudogs on every case, park.**
-      On wakeup, find which case fired, dequeue sudogs from the
-      others, return.
-- [ ] **7.5 `default` case.**
-      Trivial: pass 1 falls through to default if nothing ready.
+> No language `select` syntax, so the public API is reflect-style:
+> `select_(ops: []Select_Op, block: bool) -> (chosen, recv_ok)` where each
+> `Select_Op` is `{c, elem, dir}`. The whole algorithm is one proc (`select.odin`,
+> built test-first). DEVIATIONS: Odin has no `goto` (Go's label-based `selectgo`
+> became pass-1 early-returns + linear pass 2/3) and no closures (Go's `unlockf`
+> closure passed to send/recv → factored `chan_send_elem`/`chan_recv_elem` shared
+> helpers + `selectgo` calls `selunlock` itself); insertion-sort lock order vs
+> Go's heapsort; per-call heap-allocated poll/lock order scratch.
+
+- [x] **7.1 Concept: two-phase locking.** Captured in `select.odin`'s header doc
+      comment (random poll order for fairness; address-sorted lock order to avoid
+      lock-ordering deadlock between concurrent selects).
+- [x] **7.2 `Select_Op` + `selectgo` skeleton.** `Select_Op`/`Select_Dir`,
+      `sellock`/`selunlock`/`selparkcommit`, address-sorted `lockorder` + random
+      `pollorder`. Mirrors `select.go:34/45/63/122`.
+- [x] **7.3 Pass 1: poll non-blocking.** Each case: recv-from-sender / bufrecv /
+      rclose / send-to-receiver / bufsend; complete it, `selunlock`, return its
+      index (shares `chan_*_elem`/`wake_ready` with the channel core).
+- [x] **7.4 Pass 2/3: enqueue + park, then dequeue losers.** Enqueue a `Sudog`
+      per case on `G.waiting` (lock order), `gopark(selparkcommit)`; on wake read
+      the winner from `gp.param`, `dequeue_sudog` the losers, release all. The
+      wake-race is the `select_done` CAS in `waitq_dequeue` (`chan.go:872`);
+      `close_chan` participates. New fields: `G.waiting`/`G.select_done`,
+      `Sudog.waitlink`.
+- [x] **7.5 `default` case.** `block=false` returns `chosen=-1` when pass 1 finds
+      nothing ready. Tested. Unit tests cover ready recv/send, default, closed,
+      blocking recv (1 and 2 channels), blocking send; a 4-thread cross-M select
+      fan-in (nil-the-closed-case idiom, 2×2000 values) stresses it, looped clean.
 - [ ] **7.6 Acceptance: timeout idiom.**
       `select { case <-ch: ...; case <-time_after(50ms): ... }`
       (uses Phase 9 timer; do this task after 9.x).

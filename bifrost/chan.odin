@@ -1,5 +1,6 @@
 package bifrost
 
+import "base:intrinsics"
 import "core:mem"
 import "core:sync"
 
@@ -62,28 +63,37 @@ waitq_enqueue :: proc(q: ^Waitq, sgp: ^Sudog) {
 }
 
 // waitq_dequeue removes and returns the Sudog at the front of q, or nil if empty.
-// Mirrors (*waitq).dequeue (chan.go).
+// Mirrors (*waitq).dequeue (chan.go:872).
 //
-// DEVIATION: Go's dequeue loops, skipping any Sudog whose goroutine already lost
-// a select wake race (sgp.isSelect + a g.selectDone CAS). bifrost has no select
-// yet (Phase 7), so isSelect is always false and that branch — together with the
-// surrounding for loop — is omitted; Phase 7 reinstates it.
+// A select parks one Sudog per case across several channels, and wakers on
+// different channels (each holding only its own lock) may race to claim it. The
+// first to CAS the goroutine's select_done 0->1 wins; a loser has already had
+// the goroutine taken, so its Sudog here is stale and is skipped — hence the
+// loop. Plain (non-select) Sudogs have isSelect=false and return immediately.
 @(private)
 waitq_dequeue :: proc(q: ^Waitq) -> ^Sudog {
-	sgp := q.first
-	if sgp == nil {
-		return nil
+	for {
+		sgp := q.first
+		if sgp == nil {
+			return nil
+		}
+		y := sgp.next
+		if y == nil {
+			q.first = nil
+			q.last = nil
+		} else {
+			y.prev = nil
+			q.first = y
+			sgp.next = nil // mark as removed
+		}
+		if sgp.isSelect {
+			_, won := intrinsics.atomic_compare_exchange_strong(&sgp.g.select_done, u32(0), u32(1))
+			if !won {
+				continue // another channel already claimed this select; skip
+			}
+		}
+		return sgp
 	}
-	y := sgp.next
-	if y == nil {
-		q.first = nil
-		q.last = nil
-	} else {
-		y.prev = nil
-		q.first = y
-		sgp.next = nil // mark as removed
-	}
-	return sgp
 }
 
 // make_chan creates a channel carrying elem_size-byte elements with the given
@@ -163,6 +173,7 @@ close_chan :: proc(c: ^Hchan) {
 		}
 		sg.success = false
 		gp := sg.g
+		gp.param = rawptr(sg) // for a select woken by close: which case fired
 		gp.schedlink = to_ready
 		to_ready = gp
 	}
@@ -176,6 +187,7 @@ close_chan :: proc(c: ^Hchan) {
 		sg.elem = nil
 		sg.success = false
 		gp := sg.g
+		gp.param = rawptr(sg)
 		gp.schedlink = to_ready
 		to_ready = gp
 	}
@@ -215,51 +227,31 @@ chan_buf_slot :: proc "contextless" (c: ^Hchan, i: uint) -> rawptr {
 	return rawptr(uintptr(c.buf) + uintptr(i) * uintptr(c.elem_size))
 }
 
-// send completes a synchronous send to a receiver that is ALREADY waiting — the
-// heart of Go's channel "direct send". The sender is running; sg is the parked
-// receiver's sudog, already removed from c.recvq; ep points at the value to
-// send. send hands the value straight to the receiver with no buffer hop, then
-// wakes it. The channel lock is held on entry and must be released here (bifrost
-// always unlocks c.lock directly; Go threads an unlockf closure because its
-// callers' locks vary). Mirrors send (chan.go).
-//
-// >>> Phase 6.3 contribution: implement this. See recv (just below) for the
-//     mirror image — receiver running, sender parked — to model it on. The three
-//     steps are: copy the element into the receiver's frame, release the lock,
-//     and make the receiver runnable. Mind the copy DIRECTION (it is the
-//     opposite of recv) and that sg.elem may need clearing.
+// chan_send_elem copies the value at ep into a parked receiver's frame (sg.elem
+// points at the receiver's destination). The direct-send copy, shared by send
+// and by selectgo's send handler. sg.elem is nil only for a receiver discarding
+// the value (`<-ch`).
 @(private)
-send :: proc(c: ^Hchan, sg: ^Sudog, ep: rawptr) {
-	// Direct hand-off: copy our value into the parked receiver's frame. sg.elem
-	// points at the receiver's destination, so the direction is the opposite of
-	// recv. sg.elem is nil only for a receiver that discards the value (`<-ch`).
+chan_send_elem :: proc(c: ^Hchan, sg: ^Sudog, ep: rawptr) {
 	if sg.elem != nil {
 		mem.copy(sg.elem, ep, int(c.elem_size))
 		sg.elem = nil
 	}
-	gp := sg.g
-	sync.unlock(&c.lock)
-	sg.success = true
-	goready(gp)
 }
 
-// recv completes a synchronous receive from a sender that is ALREADY waiting.
-// The receiver is running; sg is the parked sender's sudog, already removed from
-// c.sendq; ep is where to receive into (may be nil for `<-ch` with a discarded
-// value). recv copies straight from the sender's frame into ours, then wakes the
-// sender. Mirrors recv (chan.go); the buffered rotate is added in Phase 6.4.
+// chan_recv_elem copies from a parked sender's frame into ep. Unbuffered: copy
+// sg.elem straight across. Buffered: a sender only parks when the queue is full,
+// so head (recvx) and tail (sendx) are the same slot — hand the receiver the
+// oldest queued element and store the sender's value there as the newest, qcount
+// unchanged. Shared by recv and by selectgo's recv handler. Mirrors recv
+// (chan.go).
 @(private)
-recv :: proc(c: ^Hchan, sg: ^Sudog, ep: rawptr) {
+chan_recv_elem :: proc(c: ^Hchan, sg: ^Sudog, ep: rawptr) {
 	if c.dataqsiz == 0 {
-		// Unbuffered: copy directly from the parked sender's element into ep.
 		if ep != nil {
 			mem.copy(ep, sg.elem, int(c.elem_size))
 		}
 	} else {
-		// A sender only parks when the buffer is full, so head (recvx) and tail
-		// (sendx) point at the same slot. Hand its element (the oldest) to the
-		// receiver, then store the sender's element there as the newest; qcount
-		// stays full. Mirrors recv's buffered branch (chan.go).
 		qp := chan_buf_slot(c, c.recvx)
 		if ep != nil {
 			mem.copy(ep, qp, int(c.elem_size)) // oldest queued -> receiver
@@ -272,10 +264,38 @@ recv :: proc(c: ^Hchan, sg: ^Sudog, ep: rawptr) {
 		c.sendx = c.recvx // sendx = (sendx+1) % dataqsiz, since the queue is full
 	}
 	sg.elem = nil
+}
+
+// wake_ready completes a successful handoff: mark the op succeeded, hand the
+// sudog to its goroutine via param (read by select to learn which case fired),
+// and make it runnable. The caller MUST have released the channel lock(s) first
+// (goready takes scheduler locks; and once unlocked the woken goroutine may run).
+@(private)
+wake_ready :: proc(sg: ^Sudog) {
 	gp := sg.g
-	sync.unlock(&c.lock)
 	sg.success = true
+	gp.param = rawptr(sg)
 	goready(gp)
+}
+
+// send completes a synchronous send to a receiver already waiting on c.recvq
+// (sg, already dequeued). The sender holds c.lock and only c.lock, so releasing
+// it directly is correct (in a select the caller holds more locks and unlocks
+// them itself — see selectgo). Mirrors send (chan.go).
+@(private)
+send :: proc(c: ^Hchan, sg: ^Sudog, ep: rawptr) {
+	chan_send_elem(c, sg, ep)
+	sync.unlock(&c.lock)
+	wake_ready(sg)
+}
+
+// recv completes a synchronous receive from a sender already waiting on c.sendq
+// (sg, already dequeued). Mirrors recv (chan.go).
+@(private)
+recv :: proc(c: ^Hchan, sg: ^Sudog, ep: rawptr) {
+	chan_recv_elem(c, sg, ep)
+	sync.unlock(&c.lock)
+	wake_ready(sg)
 }
 
 // chansend sends the elem_size bytes at ep on channel c. With block=true (the
@@ -333,6 +353,9 @@ chansend :: proc(c: ^Hchan, ep: rawptr, block: bool) -> bool {
 	gopark(chanparkcommit, &c.lock, .Chan_Send)
 
 	// Resumed: a receiver (recv) copied our value and woke us, or close did.
+	// The waker set gp.param to our sudog (for select); a plain send ignores it
+	// but clears it so a later op/release sees a clean param.
+	gp.param = nil
 	success := mysg.success
 	mysg.c = nil
 	release_sudog(mysg)
@@ -409,7 +432,9 @@ chanrecv :: proc(c: ^Hchan, ep: rawptr, block: bool) -> (selected: bool, receive
 	waitq_enqueue(&c.recvq, mysg)
 	gopark(chanparkcommit, &c.lock, .Chan_Receive)
 
-	// Resumed: a sender (send) copied into ep and woke us, or close did.
+	// Resumed: a sender (send) copied into ep and woke us, or close did. Clear
+	// the param the waker set (used by select; a plain recv ignores it).
+	gp.param = nil
 	success := mysg.success
 	mysg.c = nil
 	release_sudog(mysg)
