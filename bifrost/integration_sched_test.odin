@@ -205,6 +205,58 @@ test_integration_park_ready_cross_m :: proc(t: ^testing.T) {
 	testing.expect(t, xm_resumed, "parked goroutine did not resume after cross-M goready")
 }
 
+// Cross-M unbuffered channel handoff: producers and consumers run on different
+// OS threads, so every rendezvous is a goroutine parking on one M and being
+// woken by send/recv from another. This is the end-to-end exercise of the
+// per-M park callback (5.5.1) and chanparkcommit across threads.
+@(private = "file")
+xchan: ^Hchan
+
+@(private = "file")
+xchan_sum: i64
+
+@(private = "file")
+xchan_recvs: i64
+
+@(private = "file")
+xchan_producer :: proc(arg: rawptr) {
+	v := i64(1)
+	chansend(xchan, &v, true)
+}
+
+@(private = "file")
+xchan_consumer :: proc(arg: rawptr) {
+	out: i64
+	_, ok := chanrecv(xchan, &out, true)
+	if ok {
+		intrinsics.atomic_add(&xchan_sum, out)
+		intrinsics.atomic_add(&xchan_recvs, 1)
+	}
+}
+
+@(test)
+test_integration_chan_cross_m :: proc(t: ^testing.T) {
+	if integration_skip(t) do return
+
+	runtime_init(4)
+	defer runtime_teardown()
+	xchan = make_chan(size_of(i64), 0)
+	defer destroy_chan(xchan)
+
+	N :: 2000
+	xchan_sum = 0
+	xchan_recvs = 0
+	for _ in 0 ..< N {
+		go_(xchan_producer)
+		go_(xchan_consumer)
+	}
+	run()
+
+	testing.expectf(t, xchan_recvs == N, "recvs = %d, want %d", xchan_recvs, N)
+	testing.expectf(t, xchan_sum == N, "sum = %d, want %d", xchan_sum, N)
+	testing.expectf(t, live_goroutines() == 0, "live goroutines = %d, want 0", live_goroutines())
+}
+
 // Repeated init/spawn/run/teardown cycles on multiple threads must stay
 // leak-clean and not deadlock (exercises thread create/join each round).
 @(test)

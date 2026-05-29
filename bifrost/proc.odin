@@ -990,11 +990,16 @@ acquire_sudog :: proc() -> ^Sudog {
 			pp.sudogcache[pp.sudogcache_n] = s
 			pp.sudogcache_n += 1
 		}
-		sync.unlock(&sched.sudoglock)
+		// Central list empty too: allocate. Kept under sudoglock so concurrent
+		// acquire_sudog from different Ms is safe even when runtime_allocator is
+		// not thread-safe (the test tracking allocator isn't) — mirrors newg's
+		// allocation under allgs_lock. DEVIATION from Go, which allocates outside
+		// the lock because mallocgc is thread-safe and uses acquirem for GC.
 		if pp.sudogcache_n == 0 {
 			pp.sudogcache[0] = new(Sudog, runtime_allocator)
 			pp.sudogcache_n = 1
 		}
+		sync.unlock(&sched.sudoglock)
 	}
 	pp.sudogcache_n -= 1
 	s := pp.sudogcache[pp.sudogcache_n]

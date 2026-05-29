@@ -31,9 +31,13 @@ P_Status :: enum u32 {
 // Wait_Reason explains why a goroutine is _Gwaiting; stored in G.waitreason
 // and surfaced in deadlock dumps. Go keeps a large waitReason table
 // (runtime2.go); bifrost grows this enum as parking sites are added, so for
-// now it carries only the reasons used through Phase 4.
+// now it carries only the reasons used through Phase 6.
 Wait_Reason :: enum {
-	None = 0, // not waiting / reason unset.
+	None             = 0, // not waiting / reason unset.
+	Chan_Send,            // blocked sending on a channel (waitReasonChanSend).
+	Chan_Receive,         // blocked receiving on a channel (waitReasonChanReceive).
+	Chan_Send_Nil,        // send on a nil channel: blocks forever (waitReasonChanSendNilChan).
+	Chan_Receive_Nil,     // receive on a nil channel: blocks forever (waitReasonChanReceiveNilChan).
 }
 
 // casgstatus atomically transitions gp.atomicstatus from old to new.

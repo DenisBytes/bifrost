@@ -302,13 +302,16 @@
       `makechan`); `destroy_chan` frees it (no GC). `close_chan` is a shell: it
       sets the closed flag under the lock and rejects nil/double close — waking
       queued senders/receivers is 6.5 (nothing is queued until 6.3/6.4).
-- [ ] **6.3 Unbuffered send/recv (synchronous handoff).**
-      `chansend(c, elem, block)` / `chanrecv(c, elem, block)`: if a peer
-      waits, `send`/`recv` copies the element straight across the parked
-      goroutine's `sg.elem` and `goready`s it; else park on `sendq`/`recvq`
-      via `gopark(chanparkcommit, &c.lock, …)` — now safe thanks to **5.5.1**.
-      `chanparkcommit(gp, lock)` unlocks `c.lock` after the status flip. See
-      `chan.go` `chansend`/`chanrecv`/`send`/`recv`/`chanparkcommit`.
+- [x] **6.3 Unbuffered send/recv (synchronous handoff).**
+      `chansend(c, elem, block)` / `chanrecv(c, elem, block)`: if a peer waits,
+      `send`/`recv` copies the element straight across the parked goroutine's
+      `sg.elem` and `goready`s it; else park on `sendq`/`recvq` via
+      `gopark(chanparkcommit, &c.lock, …)` — safe thanks to **5.5.1**.
+      `chanparkcommit` unlocks `c.lock` after the status flip. Closed-empty recv
+      returns the zero value, ok=false; nil-channel ops block forever. Also
+      moved `acquire_sudog`'s `new(Sudog)` under `sudoglock` (concurrent alloc
+      safety, like newg). Validated single-M (both orderings) + a 4-thread
+      cross-M handoff stress (2000×2000), looped clean.
 - [ ] **6.4 Buffered send/recv.**
       Ring-buffer fast path with `qcount`/`dataqsiz`/`sendx`/`recvx`, including
       the buffered-and-sender-waiting rotate in `recv`. Same `chan.go`

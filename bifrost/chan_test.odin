@@ -123,3 +123,92 @@ test_close_chan_sets_flag :: proc(t: ^testing.T) {
 	close_chan(c)
 	testing.expect(t, c.closed != 0, "close_chan did not set the closed flag")
 }
+
+// ---------------------------------------------------------------------------
+// Unbuffered send/recv (6.3). These drive the scheduler: send/recv park
+// goroutines and hand off between them, so each test spawns goroutines and runs.
+// ---------------------------------------------------------------------------
+
+@(private = "file")
+tc_chan: ^Hchan
+
+@(private = "file")
+tc_got: int
+
+@(private = "file")
+tc_ok: bool
+
+@(private = "file")
+tc_send99 :: proc(arg: rawptr) {
+	v := 99
+	chansend(tc_chan, &v, true)
+}
+
+@(private = "file")
+tc_recv :: proc(arg: rawptr) {
+	out: int
+	_, ok := chanrecv(tc_chan, &out, true)
+	tc_got = out
+	tc_ok = ok
+}
+
+// Sender parks first; the receiver finds it on sendq and completes via recv().
+@(test)
+test_chan_recv_from_waiting_sender :: proc(t: ^testing.T) {
+	runtime_init(1)
+	defer runtime_teardown()
+	tc_chan = make_chan(size_of(int), 0)
+	defer destroy_chan(tc_chan)
+
+	tc_got, tc_ok = 0, false
+	go_(tc_send99) // runs first, parks on sendq
+	go_(tc_recv) // dequeues the sender -> recv()
+	run()
+
+	testing.expectf(t, tc_got == 99, "received %d, want 99", tc_got)
+	testing.expect(t, tc_ok, "recv ok should be true")
+}
+
+// Receiver parks first; the sender finds it on recvq and completes via send().
+// (Exercises the Phase 6.3 send() contribution.)
+@(test)
+test_chan_send_to_waiting_receiver :: proc(t: ^testing.T) {
+	runtime_init(1)
+	defer runtime_teardown()
+	tc_chan = make_chan(size_of(int), 0)
+	defer destroy_chan(tc_chan)
+
+	tc_got, tc_ok = 0, false
+	go_(tc_recv) // runs first, parks on recvq
+	go_(tc_send99) // dequeues the receiver -> send()
+	run()
+
+	testing.expectf(t, tc_got == 99, "received %d, want 99", tc_got)
+	testing.expect(t, tc_ok, "recv ok should be true")
+}
+
+@(private = "file")
+tc_recv_into_123 :: proc(arg: rawptr) {
+	out := 123
+	_, ok := chanrecv(tc_chan, &out, true)
+	tc_got = out
+	tc_ok = ok
+}
+
+// Receiving from a closed, empty channel returns the zero value with ok=false
+// and never parks (no send() involved).
+@(test)
+test_chan_recv_from_closed_empty :: proc(t: ^testing.T) {
+	runtime_init(1)
+	defer runtime_teardown()
+	tc_chan = make_chan(size_of(int), 0)
+	defer destroy_chan(tc_chan)
+	close_chan(tc_chan)
+
+	tc_got, tc_ok = -1, true
+	go_(tc_recv_into_123)
+	run()
+
+	testing.expectf(t, tc_got == 0, "recv on closed empty should zero ep, got %d", tc_got)
+	testing.expect(t, !tc_ok, "recv ok on closed empty should be false")
+}

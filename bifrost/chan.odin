@@ -143,3 +143,176 @@ close_chan :: proc(c: ^Hchan) {
 	// TODO(phase 6.5): release every sudog on sendq (each panics on resume) and
 	// recvq (each receives the zero value with ok=false), then goready them.
 }
+
+// ---------------------------------------------------------------------------
+// Send / receive (Phase 6.3: unbuffered, synchronous handoff)
+// ---------------------------------------------------------------------------
+
+// chanparkcommit is the gopark unlock callback for a goroutine blocking on a
+// channel. It runs on g0 after the goroutine is safely _Gwaiting, and releases
+// the channel lock the operation was still holding; returning true commits the
+// park. This is why the park callback had to move onto the M (Phase 5.5.1):
+// many goroutines on different threads park on different channel locks at once.
+// Mirrors chanparkcommit (chan.go). DEVIATION: Go also sets activeStackChans /
+// parkingOnChan for its movable stacks; bifrost has fixed stacks, so only the
+// unlock remains.
+@(private)
+chanparkcommit :: proc "c" (gp: ^G, lock: rawptr) -> bool {
+	sync.unlock(cast(^sync.Mutex)lock)
+	return true
+}
+
+// send completes a synchronous send to a receiver that is ALREADY waiting — the
+// heart of Go's channel "direct send". The sender is running; sg is the parked
+// receiver's sudog, already removed from c.recvq; ep points at the value to
+// send. send hands the value straight to the receiver with no buffer hop, then
+// wakes it. The channel lock is held on entry and must be released here (bifrost
+// always unlocks c.lock directly; Go threads an unlockf closure because its
+// callers' locks vary). Mirrors send (chan.go).
+//
+// >>> Phase 6.3 contribution: implement this. See recv (just below) for the
+//     mirror image — receiver running, sender parked — to model it on. The three
+//     steps are: copy the element into the receiver's frame, release the lock,
+//     and make the receiver runnable. Mind the copy DIRECTION (it is the
+//     opposite of recv) and that sg.elem may need clearing.
+@(private)
+send :: proc(c: ^Hchan, sg: ^Sudog, ep: rawptr) {
+	// Direct hand-off: copy our value into the parked receiver's frame. sg.elem
+	// points at the receiver's destination, so the direction is the opposite of
+	// recv. sg.elem is nil only for a receiver that discards the value (`<-ch`).
+	if sg.elem != nil {
+		mem.copy(sg.elem, ep, int(c.elem_size))
+		sg.elem = nil
+	}
+	gp := sg.g
+	sync.unlock(&c.lock)
+	sg.success = true
+	goready(gp)
+}
+
+// recv completes a synchronous receive from a sender that is ALREADY waiting.
+// The receiver is running; sg is the parked sender's sudog, already removed from
+// c.sendq; ep is where to receive into (may be nil for `<-ch` with a discarded
+// value). recv copies straight from the sender's frame into ours, then wakes the
+// sender. Mirrors recv (chan.go); the buffered rotate is added in Phase 6.4.
+@(private)
+recv :: proc(c: ^Hchan, sg: ^Sudog, ep: rawptr) {
+	// Unbuffered: copy directly from the parked sender's element into ep.
+	if ep != nil {
+		mem.copy(ep, sg.elem, int(c.elem_size))
+	}
+	sg.elem = nil
+	gp := sg.g
+	sync.unlock(&c.lock)
+	sg.success = true
+	goready(gp)
+}
+
+// chansend sends the elem_size bytes at ep on channel c. With block=true (the
+// only path exercised before select) it returns once the value is delivered or
+// panics if c is closed; the block=false probe is for Phase 7. Mirrors chansend
+// (chan.go), reduced: no race detector, timers, profiling, or buffer path (6.4).
+chansend :: proc(c: ^Hchan, ep: rawptr, block: bool) -> bool {
+	if c == nil {
+		if !block {
+			return false
+		}
+		gopark(nil, nil, .Chan_Send_Nil) // send on nil channel blocks forever
+		panic("unreachable")
+	}
+
+	sync.lock(&c.lock)
+
+	if c.closed != 0 {
+		sync.unlock(&c.lock)
+		panic("send on closed channel")
+	}
+
+	if sg := waitq_dequeue(&c.recvq); sg != nil {
+		// A receiver is waiting: hand the value directly to it. send releases
+		// c.lock.
+		send(c, sg, ep)
+		return true
+	}
+
+	// (Phase 6.4 inserts the buffered fast path here.)
+
+	if !block {
+		sync.unlock(&c.lock)
+		return false
+	}
+
+	// No receiver: park on the send queue until one arrives (or close wakes us).
+	gp := getg()
+	mysg := acquire_sudog()
+	mysg.elem = ep
+	mysg.g = gp
+	mysg.isSelect = false
+	mysg.c = c
+	waitq_enqueue(&c.sendq, mysg)
+	gopark(chanparkcommit, &c.lock, .Chan_Send)
+
+	// Resumed: a receiver (recv) copied our value and woke us, or close did.
+	success := mysg.success
+	mysg.c = nil
+	release_sudog(mysg)
+	if !success {
+		panic("send on closed channel")
+	}
+	return true
+}
+
+// chanrecv receives one element from channel c into ep (ep may be nil to discard
+// the value). selected is false only for a non-blocking probe that found nothing
+// (Phase 7); received is false when the channel was closed and drained (the
+// zero value is written to ep). Mirrors chanrecv (chan.go), reduced like
+// chansend; the buffer path is Phase 6.4.
+chanrecv :: proc(c: ^Hchan, ep: rawptr, block: bool) -> (selected: bool, received: bool) {
+	if c == nil {
+		if !block {
+			return false, false
+		}
+		gopark(nil, nil, .Chan_Receive_Nil) // receive on nil channel blocks forever
+		panic("unreachable")
+	}
+
+	sync.lock(&c.lock)
+
+	if c.closed != 0 && c.qcount == 0 {
+		// Closed and drained: yield the zero value, ok=false.
+		sync.unlock(&c.lock)
+		if ep != nil {
+			mem.zero(ep, int(c.elem_size))
+		}
+		return true, false
+	}
+
+	if sg := waitq_dequeue(&c.sendq); sg != nil {
+		// A sender is waiting: receive directly from it. recv releases c.lock.
+		recv(c, sg, ep)
+		return true, true
+	}
+
+	// (Phase 6.4 inserts the buffered receive path here.)
+
+	if !block {
+		sync.unlock(&c.lock)
+		return false, false
+	}
+
+	// No sender: park on the receive queue until one arrives (or close wakes us).
+	gp := getg()
+	mysg := acquire_sudog()
+	mysg.elem = ep
+	mysg.g = gp
+	mysg.isSelect = false
+	mysg.c = c
+	waitq_enqueue(&c.recvq, mysg)
+	gopark(chanparkcommit, &c.lock, .Chan_Receive)
+
+	// Resumed: a sender (send) copied into ep and woke us, or close did.
+	success := mysg.success
+	mysg.c = nil
+	release_sudog(mysg)
+	return true, success
+}
