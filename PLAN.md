@@ -312,10 +312,13 @@
       moved `acquire_sudog`'s `new(Sudog)` under `sudoglock` (concurrent alloc
       safety, like newg). Validated single-M (both orderings) + a 4-thread
       cross-M handoff stress (2000×2000), looped clean.
-- [ ] **6.4 Buffered send/recv.**
-      Ring-buffer fast path with `qcount`/`dataqsiz`/`sendx`/`recvx`, including
-      the buffered-and-sender-waiting rotate in `recv`. Same `chan.go`
-      functions.
+- [x] **6.4 Buffered send/recv.**
+      Ring-buffer fast paths via `chan_buf_slot` with `qcount`/`sendx`/`recvx`:
+      `chansend` enqueues when there is room, `chanrecv` drains the head (and
+      falls through to drain a closed channel that still has data), and `recv`'s
+      buffered branch does the queue-full rotate when a sender is parked. Tests:
+      FIFO fill/drain, blocking-on-full, closed-with-buffered-data. DEVIATION:
+      no `typedmemclr` of the consumed slot (Go does it for GC; bifrost has none).
 - [ ] **6.5 `close_chan`.**
       Wake all `sendq` waiters (they panic on resume: send on closed channel)
       and all `recvq` waiters (zero value, `ok=false`). Panic on close of a

@@ -165,6 +165,13 @@ chanparkcommit :: proc "c" (gp: ^G, lock: rawptr) -> bool {
 	return true
 }
 
+// chan_buf_slot returns a pointer to ring-buffer element i. Mirrors chanbuf
+// (chan.go): the buffer holds dataqsiz back-to-back elem_size-byte slots.
+@(private)
+chan_buf_slot :: proc "contextless" (c: ^Hchan, i: uint) -> rawptr {
+	return rawptr(uintptr(c.buf) + uintptr(i) * uintptr(c.elem_size))
+}
+
 // send completes a synchronous send to a receiver that is ALREADY waiting — the
 // heart of Go's channel "direct send". The sender is running; sg is the parked
 // receiver's sudog, already removed from c.recvq; ep points at the value to
@@ -200,9 +207,26 @@ send :: proc(c: ^Hchan, sg: ^Sudog, ep: rawptr) {
 // sender. Mirrors recv (chan.go); the buffered rotate is added in Phase 6.4.
 @(private)
 recv :: proc(c: ^Hchan, sg: ^Sudog, ep: rawptr) {
-	// Unbuffered: copy directly from the parked sender's element into ep.
-	if ep != nil {
-		mem.copy(ep, sg.elem, int(c.elem_size))
+	if c.dataqsiz == 0 {
+		// Unbuffered: copy directly from the parked sender's element into ep.
+		if ep != nil {
+			mem.copy(ep, sg.elem, int(c.elem_size))
+		}
+	} else {
+		// A sender only parks when the buffer is full, so head (recvx) and tail
+		// (sendx) point at the same slot. Hand its element (the oldest) to the
+		// receiver, then store the sender's element there as the newest; qcount
+		// stays full. Mirrors recv's buffered branch (chan.go).
+		qp := chan_buf_slot(c, c.recvx)
+		if ep != nil {
+			mem.copy(ep, qp, int(c.elem_size)) // oldest queued -> receiver
+		}
+		mem.copy(qp, sg.elem, int(c.elem_size)) // sender's value -> slot
+		c.recvx += 1
+		if c.recvx == c.dataqsiz {
+			c.recvx = 0
+		}
+		c.sendx = c.recvx // sendx = (sendx+1) % dataqsiz, since the queue is full
 	}
 	sg.elem = nil
 	gp := sg.g
@@ -238,7 +262,17 @@ chansend :: proc(c: ^Hchan, ep: rawptr, block: bool) -> bool {
 		return true
 	}
 
-	// (Phase 6.4 inserts the buffered fast path here.)
+	if c.qcount < c.dataqsiz {
+		// Buffer has room: copy into the send slot and advance the ring.
+		mem.copy(chan_buf_slot(c, c.sendx), ep, int(c.elem_size))
+		c.sendx += 1
+		if c.sendx == c.dataqsiz {
+			c.sendx = 0
+		}
+		c.qcount += 1
+		sync.unlock(&c.lock)
+		return true
+	}
 
 	if !block {
 		sync.unlock(&c.lock)
@@ -281,22 +315,41 @@ chanrecv :: proc(c: ^Hchan, ep: rawptr, block: bool) -> (selected: bool, receive
 
 	sync.lock(&c.lock)
 
-	if c.closed != 0 && c.qcount == 0 {
-		// Closed and drained: yield the zero value, ok=false.
-		sync.unlock(&c.lock)
-		if ep != nil {
-			mem.zero(ep, int(c.elem_size))
+	if c.closed != 0 {
+		if c.qcount == 0 {
+			// Closed and drained: yield the zero value, ok=false.
+			sync.unlock(&c.lock)
+			if ep != nil {
+				mem.zero(ep, int(c.elem_size))
+			}
+			return true, false
 		}
-		return true, false
+		// Closed but the buffer still holds data: fall through to drain it. A
+		// closed channel has no waiting senders, so skip the sendq check.
+	} else {
+		if sg := waitq_dequeue(&c.sendq); sg != nil {
+			// A sender is waiting: receive directly from it. recv releases c.lock.
+			recv(c, sg, ep)
+			return true, true
+		}
 	}
 
-	if sg := waitq_dequeue(&c.sendq); sg != nil {
-		// A sender is waiting: receive directly from it. recv releases c.lock.
-		recv(c, sg, ep)
+	if c.qcount > 0 {
+		// Buffer has data: take the element at the head of the ring.
+		if ep != nil {
+			mem.copy(ep, chan_buf_slot(c, c.recvx), int(c.elem_size))
+		}
+		// DEVIATION: Go typedmemclr's the consumed slot to drop the GC reference;
+		// bifrost has no GC, so the stale bytes are left (never read while outside
+		// [recvx, sendx), overwritten by a future send to that slot).
+		c.recvx += 1
+		if c.recvx == c.dataqsiz {
+			c.recvx = 0
+		}
+		c.qcount -= 1
+		sync.unlock(&c.lock)
 		return true, true
 	}
-
-	// (Phase 6.4 inserts the buffered receive path here.)
 
 	if !block {
 		sync.unlock(&c.lock)

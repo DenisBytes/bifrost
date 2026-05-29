@@ -246,3 +246,120 @@ test_chan_zero_size_signal :: proc(t: ^testing.T) {
 
 	testing.expect(t, sig_received, "zero-size signal rendezvous did not complete")
 }
+
+// ---------------------------------------------------------------------------
+// Buffered send/recv (6.4).
+// ---------------------------------------------------------------------------
+
+@(private = "file")
+buf_results: [3]int
+
+@(private = "file")
+buf_oks: [3]bool
+
+// Single goroutine fills a cap-3 buffer without blocking, then drains it; the
+// values must come back in FIFO order.
+@(private = "file")
+buf_fifo_worker :: proc(arg: rawptr) {
+	a, b, c := 10, 20, 30
+	chansend(tc_chan, &a, true)
+	chansend(tc_chan, &b, true)
+	chansend(tc_chan, &c, true)
+	for i in 0 ..< 3 {
+		out: int
+		_, ok := chanrecv(tc_chan, &out, true)
+		buf_results[i] = out
+		buf_oks[i] = ok
+	}
+}
+
+@(test)
+test_chan_buffered_fifo :: proc(t: ^testing.T) {
+	runtime_init(1)
+	defer runtime_teardown()
+	tc_chan = make_chan(size_of(int), 3)
+	defer destroy_chan(tc_chan)
+
+	buf_results = {}
+	go_(buf_fifo_worker)
+	run()
+
+	testing.expectf(
+		t,
+		buf_results[0] == 10 && buf_results[1] == 20 && buf_results[2] == 30,
+		"buffered FIFO got %v, want [10 20 30]",
+		buf_results,
+	)
+}
+
+// cap-1 buffer: the producer's second send blocks until the consumer drains,
+// exercising recv's buffered queue-full rotate (sender parked, buffer full).
+@(private = "file")
+buf_prod :: proc(arg: rawptr) {
+	a, b := 10, 20
+	chansend(tc_chan, &a, true)
+	chansend(tc_chan, &b, true) // blocks: buffer full
+}
+
+@(private = "file")
+buf_cons :: proc(arg: rawptr) {
+	for i in 0 ..< 2 {
+		out: int
+		_, ok := chanrecv(tc_chan, &out, true)
+		buf_results[i] = out
+		buf_oks[i] = ok
+	}
+}
+
+@(test)
+test_chan_buffered_blocking_full :: proc(t: ^testing.T) {
+	runtime_init(1)
+	defer runtime_teardown()
+	tc_chan = make_chan(size_of(int), 1)
+	defer destroy_chan(tc_chan)
+
+	buf_results = {}
+	go_(buf_prod)
+	go_(buf_cons)
+	run()
+
+	testing.expectf(
+		t,
+		buf_results[0] == 10 && buf_results[1] == 20,
+		"got %v, want [10 20]",
+		buf_results,
+	)
+}
+
+// Buffered data survives close: drain the two buffered values (ok=true), then
+// the closed-empty receive yields the zero value with ok=false.
+@(private = "file")
+buf_closed_worker :: proc(arg: rawptr) {
+	a, b := 1, 2
+	chansend(tc_chan, &a, true)
+	chansend(tc_chan, &b, true)
+	close_chan(tc_chan)
+	for i in 0 ..< 3 {
+		out := -1
+		_, ok := chanrecv(tc_chan, &out, true)
+		buf_results[i] = out
+		buf_oks[i] = ok
+	}
+}
+
+@(test)
+test_chan_buffered_closed_with_data :: proc(t: ^testing.T) {
+	runtime_init(1)
+	defer runtime_teardown()
+	tc_chan = make_chan(size_of(int), 2)
+	defer destroy_chan(tc_chan)
+
+	buf_results = {}
+	buf_oks = {}
+	go_(buf_closed_worker)
+	run()
+
+	testing.expectf(t, buf_results[0] == 1 && buf_oks[0], "drain 1: %d ok=%v", buf_results[0], buf_oks[0])
+	testing.expectf(t, buf_results[1] == 2 && buf_oks[1], "drain 2: %d ok=%v", buf_results[1], buf_oks[1])
+	testing.expectf(t, buf_results[2] == 0 && !buf_oks[2], "post-close: %d ok=%v, want 0/false", buf_results[2], buf_oks[2])
+}
