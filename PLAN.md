@@ -411,8 +411,16 @@
       `sync.WaitGroup`). Tests: zero-counter Wait returns immediately,
       Add/Done/Wait, single Done wakes many parked waiters. Integration: 5000
       workers fan-in on 4 threads + a 64-waiter wake-all, looped 10× clean.
-- [ ] **8.4 `Once`.**
-      Atomic done flag + Mutex. See `src/sync/once.go`.
+- [x] **8.4 `Once`.**
+      Atomic `done` flag + embedded `Mutex`: fast path is one atomic load on the
+      hot side; slow path takes the mutex, rechecks `done`, and runs `fn` with a
+      LIFO `defer` pair that sets `done` (via atomic store) before releasing the
+      mutex — so a panic in `fn` still marks the Once done, matching
+      `sync.Once`'s guarantee that `fn` is never re-attempted. Requires
+      `once_init` because `Mutex` does. Tests: runs-exactly-once,
+      repeated-calls-are-noops, observers-see-side-effect. Integration: 2000
+      concurrent callers on 4 threads with the run-count and pre-init-observation
+      checks, looped 10× clean.
 - [ ] **8.5 `RWMutex` (optional).**
       See `src/sync/rwmutex.go`.
 - [ ] **8.6 `Cond` (optional).**
