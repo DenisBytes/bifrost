@@ -8,6 +8,10 @@ import "core:thread"
 // Go's fixed 256 (runtime2.go: p.runq [256]guintptr).
 RUNQ_SIZE :: 256
 
+// SUDOG_CACHE bounds a P's local free-Sudog cache (see acquire_sudog). Matches
+// Go's effective per-P sudogcache size (proc.go acquireSudog/releaseSudog).
+SUDOG_CACHE :: 128
+
 // Gobuf is a saved execution context: enough CPU register state to resume a
 // goroutine where it left off. Mirrors Go's gobuf (runtime2.go:303).
 //
@@ -95,6 +99,35 @@ G :: struct {
 	start_arg: rawptr,
 }
 
+// Sudog ("pseudo-g") stands in for a goroutine parked on a wait queue, such as a
+// channel's send or receive queue. It is a separate struct, not links inside G,
+// because the relationship is N:M: a goroutine in a select waits on several
+// channels at once (many Sudogs per G), and a channel has many waiters (many
+// Sudogs per queue). Mirrors Go's sudog (runtime2.go:404), reduced to the fields
+// bifrost uses through Phase 6; the semaphore/treap fields (ticket, parent,
+// waittail, waiters) and the timing fields are deferred to sema (Phase 8).
+Sudog :: struct {
+	// g is the parked goroutine this Sudog represents.
+	g: ^G,
+	// next/prev doubly link the Sudog into a Waitq. next also threads free Sudogs
+	// through the central pool list (sched.sudogcache).
+	next: ^Sudog,
+	prev: ^Sudog,
+	// elem points at the data element for the channel op: the value to send, or
+	// where to receive into. It may point into the parked goroutine's own stack —
+	// the synchronous "direct send" handoff copies through it. Mirrors sudog.elem.
+	elem: rawptr,
+	// isSelect marks a Sudog enqueued by a select (Phase 7); the dequeue wake-race
+	// resolution keys off it. Always false until then.
+	isSelect: bool,
+	// success records how the goroutine was woken: true if a value was
+	// communicated over c, false if c was closed. Read by the goroutine after it
+	// resumes. Mirrors sudog.success.
+	success: bool,
+	// c is the channel this Sudog is blocked on. Mirrors sudog.c.
+	c: ^Hchan,
+}
+
 // M is an OS thread of execution. Mirrors Go's m (runtime2.go:616), reduced
 // subset.
 //
@@ -167,6 +200,13 @@ P :: struct {
 	runnext: ^G,
 	// gfree is a cache of dead Gs (with stacks) available for reuse.
 	gfree: G_List,
+	// sudogcache is this P's local cache of free Sudogs; sudogcache_n is how many
+	// of the SUDOG_CACHE slots are live. acquire_sudog/release_sudog hit this
+	// first and only touch the central list (sched.sudogcache) in batches. A P is
+	// owned by exactly one M at a time, so this needs no lock (same as Go's
+	// p.sudogcache).
+	sudogcache:   [SUDOG_CACHE]^Sudog,
+	sudogcache_n: i32,
 }
 
 // Schedt is the global scheduler state shared by all Ms. Mirrors Go's schedt
@@ -192,6 +232,12 @@ Schedt :: struct {
 	// shutdown, once set (atomic), tells every M's findrunnable to return nil so
 	// the schedule loop exits.
 	shutdown: bool,
+	// sudogcache is the central free-Sudog list (LIFO via Sudog.next), a backstop
+	// shared by all Ps and refilled/spilled in batches; sudoglock guards it.
+	// Mirrors Go's sched.sudogcache / sched.sudoglock. A dedicated lock (not
+	// sched.lock) keeps sudog churn from contending with run-queue / idle-M ops.
+	sudogcache: ^Sudog,
+	sudoglock:  sync.Mutex,
 }
 
 // Package-global runtime state. Mirrors Go's runtime globals (proc.go /

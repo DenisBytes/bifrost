@@ -966,6 +966,113 @@ gfget :: proc(pp: ^P) -> ^G {
 }
 
 // ---------------------------------------------------------------------------
+// Sudog pool (per-P cache + central freelist)
+// ---------------------------------------------------------------------------
+
+// acquire_sudog returns a clean Sudog, taken from the running P's local cache.
+// When that cache is empty it refills a batch from the central list under
+// sudoglock, allocating a fresh Sudog only if the central list is also empty.
+// Mirrors acquireSudog (proc.go:492).
+//
+// DEVIATION: Go brackets new(sudog) with acquirem/releasem so the GC cannot run
+// mid-allocation. bifrost has no GC, and scheduling is cooperative (no
+// preemption point inside this proc), so the running goroutine cannot migrate
+// Ps here — getm().p is stable without pinning.
+@(private)
+acquire_sudog :: proc() -> ^Sudog {
+	pp := getm().p
+	if pp.sudogcache_n == 0 {
+		sync.lock(&sched.sudoglock)
+		for pp.sudogcache_n < SUDOG_CACHE / 2 && sched.sudogcache != nil {
+			s := sched.sudogcache
+			sched.sudogcache = s.next
+			s.next = nil
+			pp.sudogcache[pp.sudogcache_n] = s
+			pp.sudogcache_n += 1
+		}
+		sync.unlock(&sched.sudoglock)
+		if pp.sudogcache_n == 0 {
+			pp.sudogcache[0] = new(Sudog, runtime_allocator)
+			pp.sudogcache_n = 1
+		}
+	}
+	pp.sudogcache_n -= 1
+	s := pp.sudogcache[pp.sudogcache_n]
+	pp.sudogcache[pp.sudogcache_n] = nil
+	if s.elem != nil {
+		panic("acquire_sudog: cached sudog has non-nil elem")
+	}
+	return s
+}
+
+// release_sudog returns s to the running P's local cache after asserting it is
+// fully detached. A full local cache spills half to the central list under
+// sudoglock first. Mirrors releaseSudog (proc.go:530); the checks mirror Go's
+// throws so a sudog still linked into a queue or carrying state is caught at the
+// point of the bug rather than corrupting the next op that reuses it.
+@(private)
+release_sudog :: proc(s: ^Sudog) {
+	if s.elem != nil {
+		panic("release_sudog: sudog with non-nil elem")
+	}
+	if s.isSelect {
+		panic("release_sudog: sudog with isSelect set")
+	}
+	if s.next != nil || s.prev != nil {
+		panic("release_sudog: sudog still linked in a waitq")
+	}
+	if s.c != nil {
+		panic("release_sudog: sudog with non-nil c")
+	}
+
+	pp := getm().p
+	if pp.sudogcache_n == SUDOG_CACHE {
+		// Transfer half of the local cache to the central list.
+		first: ^Sudog
+		last: ^Sudog
+		for pp.sudogcache_n > SUDOG_CACHE / 2 {
+			pp.sudogcache_n -= 1
+			p := pp.sudogcache[pp.sudogcache_n]
+			pp.sudogcache[pp.sudogcache_n] = nil
+			if first == nil {
+				first = p
+			} else {
+				last.next = p
+			}
+			last = p
+		}
+		sync.lock(&sched.sudoglock)
+		last.next = sched.sudogcache
+		sched.sudogcache = first
+		sync.unlock(&sched.sudoglock)
+	}
+	pp.sudogcache[pp.sudogcache_n] = s
+	pp.sudogcache_n += 1
+}
+
+// sudog_pool_free frees every Sudog held in the per-P caches and the central
+// list. Called from runtime_teardown before the Ps and sched are torn down. A
+// clean run returns every acquired Sudog before finishing, so this frees all of
+// them; a Sudog still attached to a parked goroutine at teardown would be a
+// goroutine leak (caught separately by live_goroutines).
+@(private)
+sudog_pool_free :: proc() {
+	for pp in allp {
+		for i in 0 ..< int(pp.sudogcache_n) {
+			free(pp.sudogcache[i], runtime_allocator)
+			pp.sudogcache[i] = nil
+		}
+		pp.sudogcache_n = 0
+	}
+	for s := sched.sudogcache; s != nil; {
+		next := s.next
+		free(s, runtime_allocator)
+		s = next
+	}
+	sched.sudogcache = nil
+}
+
+// ---------------------------------------------------------------------------
 // Teardown (minimal; a fuller per-test harness arrives in Phase 13.2)
 // ---------------------------------------------------------------------------
 
@@ -992,6 +1099,10 @@ runtime_teardown :: proc() {
 	allgs = nil
 
 	stack_free(m0.g0_stack)
+
+	// Free pooled Sudogs (per-P caches + central list) before the Ps and sched
+	// that hold them are reset.
+	sudog_pool_free()
 
 	for pp in allp {
 		free(pp, runtime_allocator)

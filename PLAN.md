@@ -286,15 +286,20 @@
 > start (only `block=true` is exercised now) so Phase 7 `select`'s
 > non-blocking probes drop in cheaply.
 
-- [ ] **6.1 `Sudog` + `Waitq` + sudog pool.**
+- [x] **6.1 `Sudog` + `Waitq` + sudog pool.**
       `Sudog` = subset of `runtime2.go:404` (`g`, `next`, `prev`, `elem`,
-      `success`, `c`, `isSelect`); `Waitq{first,last}` with enqueue/dequeue.
-      `acquire_sudog`/`release_sudog` with a per-P cache backed by a central
-      freelist under `sched.lock`, mirroring `proc.go:492`.
-- [ ] **6.2 `Hchan` struct + `make_chan(elem_size, capacity)` + `close_chan`.**
-      Untyped core mirroring `chan.go:34`: `qcount, dataqsiz, buf, elem_size,
-      closed, sendx, recvx, sendq, recvq, lock: sync.Mutex`. Allocate the ring
-      buffer inline after the header like `chan.go` `makechan`.
+      `success`, `c`, `isSelect`); `Waitq{first,last}` with enqueue/dequeue
+      (`chan.odin`). `acquire_sudog`/`release_sudog` with a per-P cache backed by
+      a central freelist, mirroring `proc.go:492`. DEVIATION: the central list
+      uses a dedicated `sched.sudoglock` (like Go's `sched.sudoglock`), not the
+      run-queue `sched.lock`, so sudog churn doesn't contend with scheduling. The
+      `Hchan` struct also landed here (it is type-coupled to `Sudog.c`/`Waitq`);
+      `dequeue`'s select wake-race skip is deferred to Phase 7. `sudog_pool_free`
+      reclaims pooled sudogs at teardown (bifrost has no GC).
+- [ ] **6.2 `make_chan(elem_size, capacity)` + `close_chan`.**
+      The `Hchan` struct already exists (6.1). Add `make_chan`, allocating the
+      ring buffer inline after the header like `chan.go` `makechan`, and the
+      `close_chan` shell. Mirrors `chan.go`.
 - [ ] **6.3 Unbuffered send/recv (synchronous handoff).**
       `chansend(c, elem, block)` / `chanrecv(c, elem, block)`: if a peer
       waits, `send`/`recv` copies the element straight across the parked
