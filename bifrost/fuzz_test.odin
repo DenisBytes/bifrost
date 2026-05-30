@@ -52,14 +52,7 @@ test_fuzz_seed_setter_round_trip :: proc(t: ^testing.T) {
 	runtime_set_fuzz_seed(0) // reset so subsequent tests run in normal mode
 }
 
-// Verifies the perturbation actually fires by observing pick ordering. Five
-// workers each log their id, gosched (which puts them onto the global runq for
-// fairness), then log id+100. After all five reach the gosched phase, the
-// global runq holds them in FIFO order; the second phase's order is determined
-// by globrunqget — under FIFO it's spawn order, under fuzz it's seed-permuted.
-// A test like the property test would PASS even if the fuzz path were
-// no-op'd; this test catches that silent regression.
-
+// Helpers for test_fuzz_perturbation_is_active (full doc on the test itself).
 @(private = "file")
 fz_order_log: [10]i32
 
@@ -106,6 +99,13 @@ run_fuzz_order_under_seed :: proc(seed: u64) -> [5]i32 {
 	return post_gosched
 }
 
+// Verifies the perturbation actually fires by observing pick ordering. Five
+// workers each log their id, gosched (which puts them onto the global runq for
+// fairness), then log id+100. After all five reach the gosched phase, the
+// global runq holds them in FIFO order; the second phase's order is
+// determined by globrunqget — under FIFO it's spawn order [101..105], under
+// fuzz it's seed-permuted. The order-invariant property test above would PASS
+// even if the fuzz path were no-op'd; this test catches that silent regression.
 @(test)
 test_fuzz_perturbation_is_active :: proc(t: ^testing.T) {
 	defer runtime_set_fuzz_seed(0)

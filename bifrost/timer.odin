@@ -159,14 +159,17 @@ time_sleep_wake :: proc(arg: rawptr) {
 //
 // Mirrors time.After (src/time/sleep.go), reduced to one-shot.
 //
-// CONTRACT (lifetime): the caller owns the returned Chan and must chan_destroy
-// it. chan_destroy AFTER the timer has fired is safe; chan_destroy BEFORE the
-// timer fires is undefined — the queued Timer.f would write into freed memory
-// (there is no timer-cancel API yet). In the typical select-with-timeout flow,
-// destroying after the select returns is safe only when the timeout case was
-// the one chosen — otherwise drain the timeout chan first to ensure the
-// callback has run. This is a known limitation; a timer-cancel API is a
-// follow-up.
+// CONTRACT: the caller MUST treat the returned Chan as receive-only. Sending
+// into it fills the cap-1 buffer ahead of the timer; the legitimate fire then
+// hits the "buffer unexpectedly full" panic. Receive (in a select or directly)
+// and discard the value if you don't need it.
+//
+// LIFETIME: chan_destroy AFTER the timer has fired is safe; chan_destroy
+// BEFORE the timer fires is undefined — the queued Timer.f would write into
+// freed memory (there is no timer-cancel API yet). In the typical
+// select-with-timeout flow, destroying after the select returns is safe only
+// when the timeout case was the one chosen — otherwise drain the timeout chan
+// first to ensure the callback has run. A timer-cancel API is a follow-up.
 time_after :: proc(d: time.Duration) -> Chan(i64) {
 	assert(allp != nil, "bifrost: call runtime_init before time_after")
 	ch := chan_make(i64, 1)
@@ -216,10 +219,12 @@ time_after_fire :: proc(arg: rawptr) {
 		sync.unlock(&c.lock)
 		return
 	}
-	// Buffer full with no waiter is unreachable under normal time_after usage
-	// (cap=1, single-shot, only this fn writes). A future caller that
-	// misuses the chan would hit this. Fail loudly — silent drop would mask
-	// the misuse (matches the runtime's fail-fast-on-internal-invariant style).
+	// Buffer full with no waiter is unreachable under correct time_after usage
+	// (cap=1, only this fn ever writes). The only reachable trigger is a
+	// caller that sent into the returned Chan themselves — see time_after's
+	// receive-only CONTRACT. Fail loudly so the misuse is named, not silently
+	// dropped (a silent drop would make the missed timeout look like a deeper
+	// scheduler bug).
 	sync.unlock(&c.lock)
-	panic("time_after_fire: chan buffer unexpectedly full")
+	panic("time_after_fire: chan buffer unexpectedly full — did the caller send into the channel returned by time_after? It is receive-only.")
 }

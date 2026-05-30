@@ -1208,21 +1208,27 @@ runtime_teardown :: proc() {
 	delete(allms, runtime_allocator)
 	allms = nil
 
-	// Free each P's timer heap BEFORE freeing Gs / channels. A leaked Timer.f
-	// could reference either (time_sleep_wake stores ^G; time_after_fire stores
-	// ^Hchan), so we must drop the heap before those allocations go away. A
-	// non-empty heap here means an operation pushed a timer that never fired
-	// before run() returned — print f/arg as raw pointers (we cannot deref
-	// without knowing the kind, and the type of arg varies with f).
+	// Free each P's timer heap BEFORE freeing Gs / channels. Timer.arg's
+	// concrete type is determined by Timer.f, so we dispatch on f to print a
+	// useful diagnostic for each known kind. Unknown kinds fall back to raw
+	// pointers (rather than guessing — guessing was the C2 bug the prior
+	// review caught).
 	for pp in allp {
 		for t in pp.timers {
-			fmt.eprintfln(
-				"  timer leak: pp=%d deadline=%d f=%p arg=%p",
-				pp.id,
-				t.deadline,
-				rawptr(t.f),
-				t.arg,
-			)
+			switch t.f {
+			case time_sleep_wake:
+				gp := cast(^G)t.arg
+				goid: u64
+				if gp != nil {
+					goid = gp.goid
+				}
+				fmt.eprintfln("  timer leak (sleep): pp=%d deadline=%d goid=%d", pp.id, t.deadline, goid)
+			case time_after_fire:
+				c := cast(^Hchan)t.arg
+				fmt.eprintfln("  timer leak (after): pp=%d deadline=%d chan=%p", pp.id, t.deadline, c)
+			case:
+				fmt.eprintfln("  timer leak (unknown): pp=%d deadline=%d f=%p arg=%p", pp.id, t.deadline, rawptr(t.f), t.arg)
+			}
 		}
 		delete(pp.timers)
 	}

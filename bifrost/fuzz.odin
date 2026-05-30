@@ -26,7 +26,14 @@ import "base:intrinsics"
 // advances it via CAS, so multi-M is safe. The xorshift STREAM is deterministic
 // per seed, but the MAPPING (which M consumes which value) depends on OS thread
 // arrival at the CAS. So:
-//   - gomaxprocs == 1: byte-identical replay for the same seed.
+//   - gomaxprocs == 1, no timers: byte-identical replay for the same seed.
+//     Pure goroutine workloads (channels, select, sema, Mutex, ...) reproduce.
+//   - With timers: replay diverges. time_sleep / time_after expire against
+//     mono_now_ns, which is NOT seeded, and PARK_TIMEOUT-driven stopm wakeups
+//     are wall-clock-paced. A goready'd-from-timer goroutine landing on the
+//     runq mid-perturbation shifts sched.runq.n and therefore the (r % n)
+//     index even when r is identical. Fuzz under timer workloads is still
+//     useful for *finding* bugs; replay is not byte-identical.
 //   - gomaxprocs >  1: same set of perturbations applied in seed-determined
 //     order to the global PRNG, but goroutine-pick order across Ms is also
 //     subject to OS scheduling. Sufficient for shaking out ordering bugs,
