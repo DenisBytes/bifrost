@@ -23,9 +23,18 @@ import "base:intrinsics"
 //   run()
 //
 // API design choice: a single global seed. Each fuzz_next call atomically
-// advances it via CAS, so multi-M is safe and the visible sequence is
-// deterministic-per-seed (the OS-thread arrival order at the CAS is the only
-// nondeterminism; in practice the cooperative scheduler keeps it stable).
+// advances it via CAS, so multi-M is safe. The xorshift STREAM is deterministic
+// per seed, but the MAPPING (which M consumes which value) depends on OS thread
+// arrival at the CAS. So:
+//   - gomaxprocs == 1: byte-identical replay for the same seed.
+//   - gomaxprocs >  1: same set of perturbations applied in seed-determined
+//     order to the global PRNG, but goroutine-pick order across Ms is also
+//     subject to OS scheduling. Sufficient for shaking out ordering bugs,
+//     insufficient for byte-identical multi-M replay (follow-up: per-P seed).
+// Disable race: a non-zero seed can produce ONE extra perturbation past a
+// concurrent runtime_set_fuzz_seed(0) (the racing fuzz_next has already loaded
+// a non-zero value when the disable lands). For test cleanup correctness,
+// reset the seed BEFORE the next test creates goroutines.
 
 @(private)
 fuzz_seed_state: u64
@@ -44,6 +53,9 @@ runtime_fuzz_active :: proc "contextless" () -> bool {
 
 // fuzz_next advances the seed via xorshift64 and returns the previous value.
 // Returns 0 when the fuzzer is disabled so call sites can check the result.
+// xorshift64 with shifts (13, 7, 17) is a bijection on u64 \ {0}: given a
+// non-zero input the output is non-zero, so no degenerate-input guard is
+// needed beyond the cur==0 disable check at the top of the loop.
 @(private)
 fuzz_next :: proc "contextless" () -> u64 {
 	for {
@@ -55,9 +67,6 @@ fuzz_next :: proc "contextless" () -> u64 {
 		x ~= x << 13
 		x ~= x >> 7
 		x ~= x << 17
-		if x == 0 {
-			x = 0xDEAD_BEEF_CAFE_F00D // keep the stream alive on degenerate input
-		}
 		_, ok := intrinsics.atomic_compare_exchange_strong(&fuzz_seed_state, cur, x)
 		if ok {
 			return cur

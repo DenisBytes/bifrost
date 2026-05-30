@@ -131,6 +131,7 @@ time_sleep :: proc(d: time.Duration) {
 	if d <= 0 {
 		return
 	}
+	assert(allp != nil, "bifrost: call runtime_init before time_sleep")
 	gp := getg()
 	pp := getm().p
 	deadline := mono_now_ns() + i64(d)
@@ -167,6 +168,7 @@ time_sleep_wake :: proc(arg: rawptr) {
 // callback has run. This is a known limitation; a timer-cancel API is a
 // follow-up.
 time_after :: proc(d: time.Duration) -> Chan(i64) {
+	assert(allp != nil, "bifrost: call runtime_init before time_after")
 	ch := chan_make(i64, 1)
 	pp := getm().p
 	deadline := mono_now_ns() + i64(d)
@@ -176,11 +178,16 @@ time_after :: proc(d: time.Duration) -> Chan(i64) {
 
 // time_after_fire is the timer callback used by time_after. It does a
 // non-parking send onto the channel — direct handoff to a parked select
-// receiver if one is waiting, else a buffer write, else drop. Runs on g0, so
-// it MUST NOT call chansend (chansend can park, and a park from g0 is illegal).
+// receiver if one is waiting, else a buffer write. Runs on g0, so it MUST
+// inline the send logic: chansend on a closed channel would panic (not the
+// desired drop semantics for a one-shot fire) and on the parking path would
+// gopark → mcall from g0, which is illegal. The cap=1 invariant is checked
+// against c.elem_size — a future caller reusing this fn with a different
+// elem_size would corrupt the buffer.
 @(private)
 time_after_fire :: proc(arg: rawptr) {
 	c := cast(^Hchan)arg
+	assert(c.elem_size == size_of(i64), "time_after_fire: unexpected elem_size")
 	tick := mono_now_ns()
 	sync.lock(&c.lock)
 	if c.closed != 0 {
@@ -190,6 +197,9 @@ time_after_fire :: proc(arg: rawptr) {
 	if sg := waitq_dequeue(&c.recvq); sg != nil {
 		// A select waiter is parked here: hand the value directly to it and
 		// wake it. wake_ready sets sg.g.param so selectgo identifies this case.
+		// chan lock is released BEFORE wake_ready because goready takes
+		// scheduler locks; nesting would invert chan/sched order (mirrors
+		// chan.odin's send / recv).
 		chan_send_elem(c, sg, rawptr(&tick))
 		sync.unlock(&c.lock)
 		wake_ready(sg)
@@ -203,8 +213,13 @@ time_after_fire :: proc(arg: rawptr) {
 			c.sendx = 0
 		}
 		c.qcount += 1
+		sync.unlock(&c.lock)
+		return
 	}
-	// Else: buffer full and no waiter. Drop, matching Go's time.After (the
-	// returned chan is cap=1, so excess fires would be no-ops anyway).
+	// Buffer full with no waiter is unreachable under normal time_after usage
+	// (cap=1, single-shot, only this fn writes). A future caller that
+	// misuses the chan would hit this. Fail loudly — silent drop would mask
+	// the misuse (matches the runtime's fail-fast-on-internal-invariant style).
 	sync.unlock(&c.lock)
+	panic("time_after_fire: chan buffer unexpectedly full")
 }

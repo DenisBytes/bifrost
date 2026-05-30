@@ -950,7 +950,11 @@ globrunqputbatch :: proc(head, tail: ^G, n: i32) {
 // Mirrors globrunqget (proc.go:7311). When the deterministic fuzzer is active
 // (runtime_set_fuzz_seed), the pick is a pseudo-random index in the queue
 // rather than the FIFO head — this is the perturbation surface that the fuzzer
-// uses to explore non-FIFO interleavings under a reproducible seed.
+// uses to explore non-FIFO interleavings under a reproducible seed. NOTE: this
+// silently breaks gosched_m's "global runq is FIFO for fairness" invariant
+// (a yielding G placed at the tail can be picked next). That's the intent of
+// the fuzzer (explore unfair orderings to surface bugs), but tests sensitive
+// to gosched_m fairness must not run in fuzz mode.
 @(private)
 globrunqget :: proc() -> ^G {
 	sync.lock(&sched.lock)
@@ -1204,21 +1208,21 @@ runtime_teardown :: proc() {
 	delete(allms, runtime_allocator)
 	allms = nil
 
-	// Free each P's timer heap BEFORE freeing Gs. Each Timer.arg is a ^G; if Gs
-	// were freed first and any future teardown path ever invoked a Timer.f, it
-	// would deref freed memory. A non-empty heap here means a goroutine slept
-	// past run()'s return — print each leak loudly for diagnostics, matching
-	// the sema_table drain style. (live_goroutines()==0 in tests already catches
-	// this; the print is defense in depth for shutdown paths bypassing the
-	// normal `run() returns when grunning==0` rule.)
+	// Free each P's timer heap BEFORE freeing Gs / channels. A leaked Timer.f
+	// could reference either (time_sleep_wake stores ^G; time_after_fire stores
+	// ^Hchan), so we must drop the heap before those allocations go away. A
+	// non-empty heap here means an operation pushed a timer that never fired
+	// before run() returned — print f/arg as raw pointers (we cannot deref
+	// without knowing the kind, and the type of arg varies with f).
 	for pp in allp {
 		for t in pp.timers {
-			gp := cast(^G)t.arg
-			goid: u64
-			if gp != nil {
-				goid = gp.goid
-			}
-			fmt.eprintfln("  timer leak: pp=%d deadline=%d goid=%d", pp.id, t.deadline, goid)
+			fmt.eprintfln(
+				"  timer leak: pp=%d deadline=%d f=%p arg=%p",
+				pp.id,
+				t.deadline,
+				rawptr(t.f),
+				t.arg,
+			)
 		}
 		delete(pp.timers)
 	}
@@ -1247,4 +1251,7 @@ runtime_teardown :: proc() {
 	g0 = {}
 	tls_g = nil
 	tls_m = nil
+	// Fuzzer state is a process-level global; reset it so a test that enables
+	// fuzz mode cannot silently leak that into the next test.
+	intrinsics.atomic_store(&fuzz_seed_state, u64(0))
 }
