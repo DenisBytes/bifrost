@@ -44,7 +44,7 @@ rwmutex_init :: proc(rw: ^RWMutex) {
 
 // rwmutex_rlock acquires a read lock. Multiple readers may hold the lock
 // simultaneously; if a writer holds (or is queued for) the lock the call
-// blocks until the writer releases. Mirrors RLock (rwmutex.go).
+// blocks until the writer releases. Mirrors (*RWMutex).RLock (rwmutex.go:67).
 rwmutex_rlock :: proc(rw: ^RWMutex) {
 	// intrinsics.atomic_add returns OLD; new = old + 1. New < 0 (writer pending).
 	if intrinsics.atomic_add(&rw.reader_count, i32(1)) + 1 < 0 {
@@ -52,7 +52,8 @@ rwmutex_rlock :: proc(rw: ^RWMutex) {
 	}
 }
 
-// rwmutex_runlock releases one reader hold. Mirrors RUnlock (rwmutex.go).
+// rwmutex_runlock releases one reader hold. Mirrors (*RWMutex).RUnlock
+// (rwmutex.go:114).
 rwmutex_runlock :: proc(rw: ^RWMutex) {
 	if r := intrinsics.atomic_add(&rw.reader_count, i32(-1)) - 1; r < 0 {
 		rwmutex_runlock_slow(rw, r)
@@ -60,7 +61,8 @@ rwmutex_runlock :: proc(rw: ^RWMutex) {
 }
 
 // Slow path: a writer is pending. Detect double-RUnlock, then decrement
-// reader_wait; the last departing reader wakes the writer.
+// reader_wait; the last departing reader wakes the writer. Mirrors
+// (*RWMutex).rUnlockSlow (rwmutex.go:129).
 @(private)
 rwmutex_runlock_slow :: proc(rw: ^RWMutex, r: i32) {
 	// r is the NEW reader_count after our -1. r + 1 == 0 means readers count
@@ -77,7 +79,7 @@ rwmutex_runlock_slow :: proc(rw: ^RWMutex, r: i32) {
 }
 
 // rwmutex_lock acquires the write lock, blocking until all readers have left
-// and any other writer has released. Mirrors Lock (rwmutex.go).
+// and any other writer has released. Mirrors (*RWMutex).Lock (rwmutex.go:144).
 rwmutex_lock :: proc(rw: ^RWMutex) {
 	// Exclude other writers first.
 	mutex_lock(&rw.w)
@@ -92,7 +94,7 @@ rwmutex_lock :: proc(rw: ^RWMutex) {
 }
 
 // rwmutex_unlock releases the write lock and wakes any pending readers.
-// Mirrors Unlock (rwmutex.go).
+// Mirrors (*RWMutex).Unlock (rwmutex.go:201).
 rwmutex_unlock :: proc(rw: ^RWMutex) {
 	// Restore reader_count to non-negative.
 	r := intrinsics.atomic_add(&rw.reader_count, RW_MAX_READERS) + RW_MAX_READERS

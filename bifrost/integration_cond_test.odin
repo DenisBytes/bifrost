@@ -79,9 +79,6 @@ pc_queue: int
 pc_consumed: i64
 
 @(private = "file")
-pc_done_producers: i32
-
-@(private = "file")
 pc_producer :: proc(arg: rawptr) {
 	mutex_lock(&pc_m)
 	pc_queue += 1
@@ -111,7 +108,6 @@ test_integration_cond_producer_consumer :: proc(t: ^testing.T) {
 
 	pc_queue = 0
 	pc_consumed = 0
-	pc_done_producers = 0
 	for _ in 0 ..< PC_TOTAL {
 		go_(pc_consumer) // many will park on the cond
 	}

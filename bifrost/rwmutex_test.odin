@@ -92,5 +92,5 @@ test_rwmutex_multiple_readers_concurrent :: proc(t: ^testing.T) {
 	go_(rw_reader_b) // must RLock (not block), increment, then release
 	run()
 
-	testing.expect(t, rw_both_held, "two RLocks did not overlap (writer-exclusion semantics wrong)")
+	testing.expect(t, rw_both_held, "two RLocks did not overlap — reader-reader exclusion incorrectly imposed")
 }
