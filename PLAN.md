@@ -421,8 +421,17 @@
       repeated-calls-are-noops, observers-see-side-effect. Integration: 2000
       concurrent callers on 4 threads with the run-count and pre-init-observation
       checks, looped 10× clean.
-- [ ] **8.5 `RWMutex` (optional).**
-      See `src/sync/rwmutex.go`.
+- [x] **8.5 `RWMutex`.**
+      Faithful port of `sync.RWMutex` (`src/sync/rwmutex.go`): a write-side
+      `Mutex` for writer-vs-writer exclusion, two semas (`reader_sem` /
+      `writer_sem`), and the `reader_count` / `reader_wait` accounting where a
+      writer atomically subtracts `RW_MAX_READERS` from `reader_count` to flag
+      itself pending, sets `reader_wait` to the captured reader count, and
+      sleeps until the last departing reader posts the writer sema. Detects
+      double-RUnlock and Unlock-of-unlocked. Tests: basic rlock/runlock,
+      lock/unlock, multi-reader concurrency. Integration: 200 writers + 2000
+      readers on 4 threads proving both writer exclusion (exact non-atomic
+      count) and reader concurrency (peak concurrent readers > 1), looped 10×.
 - [ ] **8.6 `Cond` (optional).**
       See `src/sync/cond.go`.
 
