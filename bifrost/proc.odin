@@ -947,7 +947,10 @@ globrunqputbatch :: proc(head, tail: ^G, n: i32) {
 }
 
 // globrunqget pops one goroutine from the global run queue (under sched.lock).
-// Mirrors globrunqget (proc.go:7311).
+// Mirrors globrunqget (proc.go:7311). When the deterministic fuzzer is active
+// (runtime_set_fuzz_seed), the pick is a pseudo-random index in the queue
+// rather than the FIFO head — this is the perturbation surface that the fuzzer
+// uses to explore non-FIFO interleavings under a reproducible seed.
 @(private)
 globrunqget :: proc() -> ^G {
 	sync.lock(&sched.lock)
@@ -956,6 +959,31 @@ globrunqget :: proc() -> ^G {
 	if gp == nil {
 		return nil
 	}
+	if sched.runq.n > 1 {
+		r := fuzz_next()
+		if r != 0 {
+			// Walk to a random index and unlink it.
+			idx := int(r % u64(sched.runq.n))
+			prev: ^G
+			curr := gp
+			for i := 0; i < idx; i += 1 {
+				prev = curr
+				curr = curr.schedlink
+			}
+			if prev == nil {
+				sched.runq.head = curr.schedlink
+			} else {
+				prev.schedlink = curr.schedlink
+			}
+			if sched.runq.tail == curr {
+				sched.runq.tail = prev
+			}
+			sched.runq.n -= 1
+			curr.schedlink = nil
+			return curr
+		}
+	}
+	// Normal FIFO path.
 	sched.runq.head = gp.schedlink
 	if sched.runq.head == nil {
 		sched.runq.tail = nil

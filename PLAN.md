@@ -583,11 +583,20 @@
       waiting on so "infinite select" cases are obvious in the dump.
 
 - [ ] **13.6 Deterministic-schedule fuzzer (the core idea).**
-      The most important task in this phase.
-      Because *we own the scheduler*, we can replace its `findrunnable`
-      with a deterministic, seed-driven one. Then we run the same
-      test under thousands of different schedules and look for any
-      that deadlock, leak, panic, or assert. This is essentially
+      SKELETON LANDED (`bifrost/fuzz.odin`): `runtime_set_fuzz_seed(u64)` /
+      `runtime_fuzz_active()` public API, an xorshift64 PRNG advanced via CAS
+      so multi-M is safe, and a perturbation point inside `globrunqget` —
+      when seed != 0 it picks a pseudo-random index in the global runq instead
+      of the FIFO head. Existing 88-test suite passes under several seeds
+      (0, 1, 42, 1337, 0xDEADBEEF). REMAINING: a `bifrost.testing.fuzz`
+      sweeper that runs a test under N seeds reporting failing seeds for
+      replay; perturbation at more sites (local runqs, select wake-race,
+      goready scheduling); acceptance against a hand-written buggy program.
+
+      The most important task in this phase. Because *we own the scheduler*,
+      we can replace its `findrunnable` with a deterministic, seed-driven one.
+      Then we run the same test under thousands of different schedules and
+      look for any that deadlock, leak, panic, or assert. This is essentially
       what Microsoft's *Coyote* and Rust's *Loom* do.
       - Add a build flag / runtime mode `BIFROST_SCHED=fuzz:<seed>`
         that forces the scheduler to pick the next runnable G from
