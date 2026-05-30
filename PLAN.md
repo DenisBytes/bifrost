@@ -448,15 +448,24 @@
 
 ## Phase 9 — Timers and `Sleep`
 
-- [ ] **9.1 Min-heap of timers per P.**
-      Mirror `time.go` `pp.timers`. Each timer has `when`, `period`,
-      `f`, `arg`.
-- [ ] **9.2 `time_sleep(ns)`.**
-      `gopark` current g; on timer fire, `goready`. See `time.go`
-      `timeSleep`.
-- [ ] **9.3 Timer firing in `findrunnable`.**
-      Before stealing, check next timer; if expired, run it. See
-      `proc.go` `checkTimers`.
+- [x] **9.1 Min-heap of timers per P.**
+      `P` gains `timers: [dynamic]Timer` and `timers_lock: sync.Mutex`; `Timer`
+      carries an absolute monotonic-ns `deadline` and `f(arg)` callback. Heap
+      ops are sift-up/down in `bifrost/timer.odin`. DEVIATION: Go's field is
+      `when` but that's an Odin reserved word, so bifrost uses `deadline`. No
+      `period` yet (one-shot only).
+- [x] **9.2 `time_sleep(d)`.**
+      Pushes a Timer onto the running M's P whose callback `goready`s the
+      current g, then `gopark`s with `Wait_Reason.Time_Sleep`. The PARK_TIMEOUT
+      re-poll wakes the M periodically so the timer fires when its deadline
+      passes; checkdead now skips the panic if any P has a pending timer (so a
+      sleeping goroutine isn't reported as a deadlock).
+- [x] **9.3 Timer firing in `findrunnable`.**
+      `findrunnable` calls `timer_run_expired(mp.p)` at the top of each loop
+      iteration; expired callbacks may `goready` goroutines onto our local
+      runq, which the next `runqget` picks up. No cross-P timer stealing yet —
+      a Timer fires only on the P it was pushed to. Tested: 100-sleeper fan-in
+      and a mixed long/short ordering test on 4 OS threads, looped 5× clean.
 
 ---
 

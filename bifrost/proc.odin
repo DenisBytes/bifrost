@@ -467,6 +467,19 @@ checkdead :: proc() {
 		return
 	}
 
+	// A pending timer on ANY P means at least one waiter is sleeping toward a
+	// known deadline — not a deadlock. The next PARK_TIMEOUT re-poll on the
+	// owning M will fire it and resume its goroutine. Lock order is sched.lock
+	// (held by caller) -> pp.timers_lock; nothing else takes them reversed.
+	for pp in allp {
+		sync.lock(&pp.timers_lock)
+		has_timer := len(pp.timers) > 0
+		sync.unlock(&pp.timers_lock)
+		if has_timer {
+			return
+		}
+	}
+
 	sync.lock(&allgs_lock)
 	defer sync.unlock(&allgs_lock)
 
@@ -504,14 +517,18 @@ execute :: proc(gp: ^G) {
 }
 
 // findrunnable returns the next goroutine to run, or nil only when shutdown has
-// been signalled. It checks the local run queue, then the global queue; if both
-// are empty it parks the M (stopm) and retries. Mirrors the structure of
-// findRunnable (proc.go:3395) minus netpoll; work stealing is added in
-// stealWork-equivalent steal_work() (Inc 4).
+// been signalled. It first fires any expired timers on this P (their callbacks
+// typically goready a sleeping goroutine onto the local runq), then checks the
+// local run queue, the global queue, and steal; if everything is empty it parks
+// the M (stopm) and retries. Mirrors findRunnable (proc.go:3395) + checkTimers
+// (proc.go); work stealing is the bifrost steal_work().
 @(private)
 findrunnable :: proc() -> ^G {
 	mp := getm()
 	for {
+		// Fire timers that have expired on our P; callbacks may goready
+		// goroutines onto our local runq, which the next runqget will pick up.
+		timer_run_expired(mp.p)
 		if gp := runqget(mp.p); gp != nil {
 			return gp
 		}
@@ -1163,6 +1180,9 @@ runtime_teardown :: proc() {
 	sudog_pool_free()
 
 	for pp in allp {
+		// Free each P's timer heap before the P itself is freed. The backing
+		// allocator was set on first append from a goroutine context (malloc).
+		delete(pp.timers)
 		free(pp, runtime_allocator)
 	}
 	delete(allp, runtime_allocator)

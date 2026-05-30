@@ -221,6 +221,13 @@ P :: struct {
 	// p.sudogcache).
 	sudogcache:   [SUDOG_CACHE]^Sudog,
 	sudogcache_n: i32,
+	// timers is a min-heap (by `when`) of pending timers scheduled on this P;
+	// time_sleep pushes onto the running M's P's heap, and the scheduler fires
+	// expired timers in findrunnable. timers_lock guards it (own-P pushes today
+	// can run on the same P from different points; cross-P stealing is a
+	// follow-up).
+	timers:      [dynamic]Timer,
+	timers_lock: sync.Mutex,
 }
 
 // Schedt is the global scheduler state shared by all Ms. Mirrors Go's schedt
