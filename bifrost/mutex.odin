@@ -1,5 +1,7 @@
 package bifrost
 
+import "base:intrinsics"
+
 // Phase 8.2: Mutex on top of the runtime semaphore. mutex_lock blocks until the
 // holder calls mutex_unlock; the uncontended path is one cansemacquire CAS on
 // lock and one xadd on unlock.
@@ -10,7 +12,10 @@ package bifrost
 // semaphore wrapper and must be initialized via mutex_init before use. No
 // spinning, no starvation mode, no anti-fairness regime — fairness follows the
 // sema's FIFO. Adequate for the sync API surface; tune later if measurement
-// shows it.
+// shows it. CONTRACT: mutex_init must run before any lock/unlock and must NOT
+// be called on a held or already-initialized Mutex — there is no extra flag to
+// distinguish "uninitialized 0" from "held 0", so re-init on a held Mutex is
+// silent UB.
 
 // Mutex is a binary semaphore: the embedded counter is 1 when the lock is free
 // and 0 when held. Initialize with mutex_init before any lock/unlock.
@@ -28,10 +33,13 @@ mutex_lock :: proc(m: ^Mutex) {
 	sema_acquire(&m.sema)
 }
 
-// mutex_unlock releases the lock, waking one waiter if any. Behavior is
-// undefined if m is not held by the caller — same contract as
-// sync.Mutex.Unlock (Go panics on this misuse; bifrost relies on sema's
-// counting semantics, so a double-unlock would silently allow two holders).
+// mutex_unlock releases the lock, waking one waiter if any. Panics on
+// double-unlock or unlock-of-never-locked: only the holder calls unlock, so the
+// sema must be 0 on entry. Mirrors sync.Mutex.Unlock (mutex.go:223), which
+// throws "sync: unlock of unlocked mutex" for the same misuse.
 mutex_unlock :: proc(m: ^Mutex) {
+	if intrinsics.atomic_load(&m.sema) != 0 {
+		panic("mutex_unlock: mutex is not held (double-unlock or never locked)")
+	}
 	sema_release(&m.sema)
 }

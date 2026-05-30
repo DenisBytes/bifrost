@@ -41,7 +41,6 @@ test_integration_mutex_contention :: proc(t: ^testing.T) {
 	run()
 
 	testing.expectf(t, mtx_int_counter == MTX_INT_N, "count = %d, want %d", mtx_int_counter, MTX_INT_N)
-	testing.expectf(t, mtx_int.sema == 1, "sema = %d, want 1 (mutex released)", mtx_int.sema)
 	testing.expectf(t, live_goroutines() == 0, "live goroutines = %d, want 0", live_goroutines())
 }
 

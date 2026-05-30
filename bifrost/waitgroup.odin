@@ -33,6 +33,11 @@ waitgroup_add :: proc(wg: ^WaitGroup, delta: i32) {
 		counter := i32(state >> 32)
 		waiters := u32(state & 0xFFFFFFFF)
 		new_counter := counter + delta
+		// Overflow-safety invariant: u32(new_counter) is stored only after
+		// new_counter >= 0 is checked here, so state>>32 is always in [0,
+		// INT_MAX] and i32(state >> 32) is always non-negative on the next load.
+		// Any i32 overflow in counter+delta therefore lands in the negative
+		// range and is caught by this branch.
 		if new_counter < 0 {
 			panic("waitgroup_add: negative counter")
 		}
@@ -82,9 +87,10 @@ waitgroup_wait :: proc(wg: ^WaitGroup) {
 			sema_acquire(&wg.sema)
 			// The waker set state to 0 as part of its draining CAS. A non-zero
 			// counter here means another Add cycle began before we observed
-			// completion — sync.WaitGroup forbids that pattern.
+			// completion — sync.WaitGroup forbids that pattern. Best-effort:
+			// the check fires only when the next cycle landed before our load.
 			if intrinsics.atomic_load(&wg.state) >> 32 != 0 {
-				panic("waitgroup_wait: WaitGroup reused before previous Wait returned")
+				panic("waitgroup_wait: state>>32 != 0 after wake — caller began a new Add cycle before this Wait returned (forbidden; see sync.WaitGroup)")
 			}
 			return
 		}
