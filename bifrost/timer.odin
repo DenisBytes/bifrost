@@ -1,5 +1,6 @@
 package bifrost
 
+import "core:mem"
 import "core:sync"
 import "core:time"
 
@@ -142,4 +143,68 @@ time_sleep :: proc(d: time.Duration) {
 time_sleep_wake :: proc(arg: rawptr) {
 	gp := cast(^G)arg
 	goready(gp)
+}
+
+// time_after returns a Chan(i64) of capacity 1 that will receive the monotonic
+// tick at firing time after d has elapsed. The canonical use is the select +
+// timeout idiom — it closes out Phase 7:
+//
+//   after_ch := time_after(50 * time.Millisecond)
+//   ops := []Select_Op{
+//       {c = my_chan.c, elem = &val, dir = .Recv},
+//       {c = after_ch.c, elem = &tick, dir = .Recv},
+//   }
+//   chosen, _ := select_(ops[:], true)
+//
+// Mirrors time.After (src/time/sleep.go), reduced to one-shot.
+//
+// CONTRACT (lifetime): the caller owns the returned Chan and must chan_destroy
+// it. chan_destroy AFTER the timer has fired is safe; chan_destroy BEFORE the
+// timer fires is undefined — the queued Timer.f would write into freed memory
+// (there is no timer-cancel API yet). In the typical select-with-timeout flow,
+// destroying after the select returns is safe only when the timeout case was
+// the one chosen — otherwise drain the timeout chan first to ensure the
+// callback has run. This is a known limitation; a timer-cancel API is a
+// follow-up.
+time_after :: proc(d: time.Duration) -> Chan(i64) {
+	ch := chan_make(i64, 1)
+	pp := getm().p
+	deadline := mono_now_ns() + i64(d)
+	timer_push(pp, Timer{deadline = deadline, f = time_after_fire, arg = rawptr(ch.c)})
+	return ch
+}
+
+// time_after_fire is the timer callback used by time_after. It does a
+// non-parking send onto the channel — direct handoff to a parked select
+// receiver if one is waiting, else a buffer write, else drop. Runs on g0, so
+// it MUST NOT call chansend (chansend can park, and a park from g0 is illegal).
+@(private)
+time_after_fire :: proc(arg: rawptr) {
+	c := cast(^Hchan)arg
+	tick := mono_now_ns()
+	sync.lock(&c.lock)
+	if c.closed != 0 {
+		sync.unlock(&c.lock)
+		return
+	}
+	if sg := waitq_dequeue(&c.recvq); sg != nil {
+		// A select waiter is parked here: hand the value directly to it and
+		// wake it. wake_ready sets sg.g.param so selectgo identifies this case.
+		chan_send_elem(c, sg, rawptr(&tick))
+		sync.unlock(&c.lock)
+		wake_ready(sg)
+		return
+	}
+	if c.qcount < c.dataqsiz {
+		// No waiter, buffer has room: stash the tick for a future receiver.
+		mem.copy(chan_buf_slot(c, c.sendx), rawptr(&tick), int(c.elem_size))
+		c.sendx += 1
+		if c.sendx == c.dataqsiz {
+			c.sendx = 0
+		}
+		c.qcount += 1
+	}
+	// Else: buffer full and no waiter. Drop, matching Go's time.After (the
+	// returned chan is cap=1, so excess fires would be no-ops anyway).
+	sync.unlock(&c.lock)
 }

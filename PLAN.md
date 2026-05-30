@@ -370,9 +370,16 @@
       nothing ready. Tested. Unit tests cover ready recv/send, default, closed,
       blocking recv (1 and 2 channels), blocking send; a 4-thread cross-M select
       fan-in (nil-the-closed-case idiom, 2×2000 values) stresses it, looped clean.
-- [ ] **7.6 Acceptance: timeout idiom.**
-      `select { case <-ch: ...; case <-time_after(50ms): ... }`
-      (uses Phase 9 timer; do this task after 9.x).
+- [x] **7.6 Acceptance: timeout idiom.**
+      `time_after(d) -> Chan(i64)` returns a cap-1 channel that fires the
+      monotonic tick after `d` via a non-parking Timer callback (direct handoff
+      to a parked select receiver if present, else buffer write, else drop —
+      matching Go's `time.After` over-fire semantics). The callback runs on g0,
+      so it inlines the send logic rather than calling `chansend` (which can
+      park). Tested via `select_` racing a value channel against a `time_after`:
+      no sender → timeout case fires. KNOWN LIMITATION: no timer-cancel API,
+      so `chan_destroy` before the timer fires is UB; documented at the
+      call site as a follow-up.
 
 ---
 
