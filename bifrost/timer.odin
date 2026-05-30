@@ -17,6 +17,12 @@ import "core:time"
 //   - No persistent timer state: every time_sleep creates a one-shot Timer.
 //     periodic timers (Go's `period` field) are not yet supported.
 //   - No timerproc / netpoller integration; firing happens in the scheduler.
+//   - Firing latency floor is PARK_TIMEOUT (200µs): on an otherwise idle
+//     runtime an M re-polls timers only when its park sema times out. Go's
+//     stopm computes time-until-next-timer and parks for exactly that long
+//     (proc.go pollUntil / checkTimers); bifrost uses the simpler polling
+//     approach. Sleeps shorter than PARK_TIMEOUT still meet the "≥ d" contract
+//     but typically observe ~PARK_TIMEOUT latency.
 
 // Timer is a one-shot scheduled callback. `deadline` is the firing time in
 // monotonic nanoseconds (compared against mono_now_ns); `f(arg)` runs on the
@@ -28,7 +34,10 @@ Timer :: struct {
 	arg:      rawptr,
 }
 
-// mono_now_ns returns the current monotonic time in nanoseconds.
+// mono_now_ns returns nanoseconds from the kernel's monotonic-raw clock
+// (`CLOCK_MONOTONIC_RAW` on Linux, via core:time tick_now). Only differences are
+// meaningful; the zero is not an externally defined epoch. Per-thread coherent
+// on the supported platform.
 @(private)
 mono_now_ns :: proc "contextless" () -> i64 {
 	return i64(time.tick_diff(time.Tick{}, time.tick_now()))
@@ -75,12 +84,20 @@ timer_sift_down :: proc(h: []Timer, start: int) {
 	}
 }
 
-// timer_push pushes a Timer onto pp's heap.
+// timer_push pushes a Timer onto pp's heap. ALLOCATOR: pp.timers latches the
+// goroutine's context.allocator on first append; goexit_entry installs the
+// malloc-backed default context, which is thread-safe — needed because multiple
+// Ms concurrently push onto their respective P's heaps. Panics on append
+// failure (OOM), mirroring newg's stack_alloc panic — silent failure here
+// would leave the goroutine forever parked with no timer to wake it.
 @(private)
 timer_push :: proc(pp: ^P, t: Timer) {
 	sync.lock(&pp.timers_lock)
 	defer sync.unlock(&pp.timers_lock)
-	append(&pp.timers, t)
+	_, err := append(&pp.timers, t)
+	if err != nil {
+		panic("timer_push: timer heap allocation failed")
+	}
 	timer_sift_up(pp.timers[:], len(pp.timers) - 1)
 }
 

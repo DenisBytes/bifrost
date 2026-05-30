@@ -39,26 +39,29 @@ test_integration_time_sleep_many :: proc(t: ^testing.T) {
 }
 
 // A mix of long and short sleeps: the short ones must complete first, proving
-// the min-heap orders timers correctly across many concurrent sleepers.
+// the min-heap orders timers correctly across many concurrent sleepers. Flags
+// are b32 read/written through intrinsics so the cross-thread ordering is
+// well-defined (a plain bool here would be a data race even if it works in
+// practice on x86_64).
 @(private = "file")
-ti_short_done_first: bool
+ti_short_done_first: b32
 
 @(private = "file")
-ti_long_done: bool
+ti_long_done: b32
 
 @(private = "file")
 ti_short_sleeper :: proc(arg: rawptr) {
 	time_sleep(20 * time.Millisecond)
 	// On a correct min-heap, all short sleepers finish well before the long one.
-	if !ti_long_done {
-		ti_short_done_first = true
+	if !intrinsics.atomic_load(&ti_long_done) {
+		intrinsics.atomic_store(&ti_short_done_first, true)
 	}
 }
 
 @(private = "file")
 ti_long_sleeper :: proc(arg: rawptr) {
 	time_sleep(200 * time.Millisecond)
-	ti_long_done = true
+	intrinsics.atomic_store(&ti_long_done, true)
 }
 
 @(test)
@@ -68,15 +71,15 @@ test_integration_time_sleep_ordering :: proc(t: ^testing.T) {
 	runtime_init(4)
 	defer runtime_teardown()
 
-	ti_short_done_first = false
-	ti_long_done = false
+	intrinsics.atomic_store(&ti_short_done_first, false)
+	intrinsics.atomic_store(&ti_long_done, false)
 	go_(ti_long_sleeper) // started first but won't finish first
 	for _ in 0 ..< 10 {
 		go_(ti_short_sleeper)
 	}
 	run()
 
-	testing.expect(t, ti_long_done, "long sleeper did not complete")
-	testing.expect(t, ti_short_done_first, "short sleepers did not finish before the long one (heap ordering broken)")
+	testing.expect(t, bool(intrinsics.atomic_load(&ti_long_done)), "long sleeper did not complete")
+	testing.expect(t, bool(intrinsics.atomic_load(&ti_short_done_first)), "short sleepers did not finish before the long one (heap ordering broken)")
 	testing.expectf(t, live_goroutines() == 0, "live goroutines = %d, want 0", live_goroutines())
 }

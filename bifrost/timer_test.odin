@@ -33,8 +33,9 @@ test_time_sleep_basic :: proc(t: ^testing.T) {
 	testing.expect(t, ts_done, "sleeping goroutine did not resume after time_sleep")
 }
 
-// The sleep MUST take at least the requested duration. We allow some slack on
-// the upper bound to keep the test stable across schedulers.
+// The sleep MUST take at least the requested duration. The contract is
+// "blocks for ≥ d", so the floor is the requested duration — slack would mask
+// a regression that returned early.
 @(test)
 test_time_sleep_observes_duration :: proc(t: ^testing.T) {
 	runtime_init(1)
@@ -46,7 +47,7 @@ test_time_sleep_observes_duration :: proc(t: ^testing.T) {
 	run()
 	elapsed := time.tick_since(start)
 
-	testing.expectf(t, elapsed >= 45 * time.Millisecond, "elapsed = %v, want >= 45ms", elapsed)
+	testing.expectf(t, elapsed >= 50 * time.Millisecond, "elapsed = %v, want >= 50ms", elapsed)
 }
 
 // Many sleepers all complete: tests the per-P heap with multiple entries.

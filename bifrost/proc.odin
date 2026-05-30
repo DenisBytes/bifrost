@@ -471,6 +471,16 @@ checkdead :: proc() {
 	// known deadline — not a deadlock. The next PARK_TIMEOUT re-poll on the
 	// owning M will fire it and resume its goroutine. Lock order is sched.lock
 	// (held by caller) -> pp.timers_lock; nothing else takes them reversed.
+	//
+	// KNOWN LIMITATION: this suppresses the deadlock panic for the FULL duration
+	// of the longest pending timer. A genuine deadlock (e.g. a goroutine stuck
+	// on a channel with no peer) on a program that has a long sleeper elsewhere
+	// will hang silently until that sleeper's timer fires, only then is the
+	// deadlock detected. A future improvement is to scan waitreasons: if any
+	// waiting goroutine has a non-Time_Sleep reason while we're suppressing,
+	// emit a diagnostic naming it; the simple rule is hard to make precise
+	// because rendezvous patterns (sleeper sends to a parked receiver) are
+	// legitimate. For now, document and proceed.
 	for pp in allp {
 		sync.lock(&pp.timers_lock)
 		has_timer := len(pp.timers) > 0
@@ -1166,6 +1176,25 @@ runtime_teardown :: proc() {
 	delete(allms, runtime_allocator)
 	allms = nil
 
+	// Free each P's timer heap BEFORE freeing Gs. Each Timer.arg is a ^G; if Gs
+	// were freed first and any future teardown path ever invoked a Timer.f, it
+	// would deref freed memory. A non-empty heap here means a goroutine slept
+	// past run()'s return — print each leak loudly for diagnostics, matching
+	// the sema_table drain style. (live_goroutines()==0 in tests already catches
+	// this; the print is defense in depth for shutdown paths bypassing the
+	// normal `run() returns when grunning==0` rule.)
+	for pp in allp {
+		for t in pp.timers {
+			gp := cast(^G)t.arg
+			goid: u64
+			if gp != nil {
+				goid = gp.goid
+			}
+			fmt.eprintfln("  timer leak: pp=%d deadline=%d goid=%d", pp.id, t.deadline, goid)
+		}
+		delete(pp.timers)
+	}
+
 	for gp in allgs {
 		stack_free(gp.stack)
 		free(gp, runtime_allocator)
@@ -1180,9 +1209,6 @@ runtime_teardown :: proc() {
 	sudog_pool_free()
 
 	for pp in allp {
-		// Free each P's timer heap before the P itself is freed. The backing
-		// allocator was set on first append from a goroutine context (malloc).
-		delete(pp.timers)
 		free(pp, runtime_allocator)
 	}
 	delete(allp, runtime_allocator)
