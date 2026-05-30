@@ -432,8 +432,17 @@
       lock/unlock, multi-reader concurrency. Integration: 200 writers + 2000
       readers on 4 threads proving both writer exclusion (exact non-atomic
       count) and reader concurrency (peak concurrent readers > 1), looped 10×.
-- [ ] **8.6 `Cond` (optional).**
-      See `src/sync/cond.go`.
+- [x] **8.6 `Cond`.**
+      Condition variable on a `u32` sema + atomic waiter count. `cond_wait`
+      atomically `waiters++` then unlocks the associated Mutex and parks on the
+      sema; `cond_signal` CAS-decrements waiters and posts one permit;
+      `cond_broadcast` atomically swaps waiters to 0 and posts that many
+      permits. CONTRACT (canonical predicate idiom): caller holds the Mutex on
+      Wait entry, and uses `for !predicate { cond_wait(c, m) }` to remain safe
+      against signal-before-wait races and spurious wakes — exactly Go's
+      `sync.Cond` contract. Tests: signal wakes one, broadcast wakes 5,
+      predicate-already-true skips parking. Integration: 1000-waiter broadcast
+      + 500-producer/500-consumer cond_signal stress on 4 threads, looped 10×.
 
 ---
 

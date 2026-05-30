@@ -37,7 +37,8 @@ rw_int_writer :: proc(arg: rawptr) {
 rw_int_reader :: proc(arg: rawptr) {
 	rwmutex_rlock(&rw_int)
 	cur := intrinsics.atomic_add(&rw_int_active_readers, 1) + 1
-	// Track the peak — multi-M should produce > 1 most of the time.
+	// Track the peak — without forcing a yield, the scheduler can sometimes
+	// serialize readers and produce max=1, which proves nothing.
 	for {
 		max := intrinsics.atomic_load(&rw_int_max_concurrent_readers)
 		if cur <= max {
@@ -46,6 +47,12 @@ rw_int_reader :: proc(arg: rawptr) {
 		if _, ok := intrinsics.atomic_compare_exchange_strong(&rw_int_max_concurrent_readers, max, cur); ok {
 			break
 		}
+	}
+	// Yield while holding the read lock so a peer reader has a real chance to
+	// enter the critical section concurrently. The peer must not block —
+	// that's exactly the reader-concurrency property under test.
+	for _ in 0 ..< 4 {
+		gosched()
 	}
 	_ = intrinsics.atomic_load(&rw_int_value) // touch the shared state
 	intrinsics.atomic_add(&rw_int_active_readers, -1)
