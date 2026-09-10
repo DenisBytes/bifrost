@@ -527,15 +527,33 @@ execute :: proc(gp: ^G) {
 }
 
 // findrunnable returns the next goroutine to run, or nil only when shutdown has
-// been signalled. It first fires any expired timers on this P (their callbacks
-// typically goready a sleeping goroutine onto the local runq), then checks the
-// local run queue, the global queue, and steal; if everything is empty it parks
-// the M (stopm) and retries. Mirrors findRunnable (proc.go:3395) + checkTimers
-// (proc.go); work stealing is the bifrost steal_work().
+// been signalled. Each pass: poll the global queue every 61st tick for fairness,
+// fire any expired timers on this P (their callbacks typically goready a
+// sleeping goroutine onto the local runq), then check the local run queue, the
+// global queue, and steal; if everything is empty it parks the M (stopm) and
+// retries. Mirrors findRunnable (proc.go:3395) + checkTimers (proc.go); work
+// stealing is the bifrost steal_work().
 @(private)
 findrunnable :: proc() -> ^G {
 	mp := getm()
 	for {
+		// Check the global run queue once in a while to ensure fairness.
+		// Otherwise two goroutines can completely occupy the local run queue by
+		// constantly respawning each other. Mirrors findRunnable's
+		// `pp.schedtick%61 == 0 && !sched.runq.empty()` check (proc.go), whose
+		// comment names this exact hazard.
+		//
+		// Load-bearing at gomaxprocs == 1, where no other M ever drains the
+		// global queue: gosched_m puts every yielding goroutine on the GLOBAL
+		// queue while go_/ready enqueue to the LOCAL ring, so without this poll
+		// one self-respawning producer starves a gosched() waiter forever
+		// (measured: 200,000 respawns, i.e. never, before this was added).
+		mp.p.schedtick += 1
+		if mp.p.schedtick % 61 == 0 {
+			if gp := globrunqget(); gp != nil {
+				return gp
+			}
+		}
 		// Fire timers that have expired on our P; callbacks may goready
 		// goroutines onto our local runq, which the next runqget will pick up.
 		timer_run_expired(mp.p)

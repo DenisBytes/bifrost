@@ -212,6 +212,12 @@ P :: struct {
 	// current G's time slice so communicate-and-wait pairs schedule as a unit.
 	// Mirrors Go's runnext slot exactly (runtime2.go:808).
 	runnext: ^G,
+	// schedtick counts scheduling decisions made on this P. findrunnable polls
+	// the global run queue every 61st tick so that a self-sustaining local
+	// producer cannot monopolise the P. Mirrors Go's p.schedtick and the
+	// `pp.schedtick%61 == 0` fairness check in findRunnable (proc.go). Written
+	// only by the M that owns this P, so a plain u32 needs no atomic.
+	schedtick: u32,
 	// gfree is a cache of dead Gs (with stacks) available for reuse.
 	gfree: G_List,
 	// sudogcache is this P's local cache of free Sudogs; sudogcache_n is how many

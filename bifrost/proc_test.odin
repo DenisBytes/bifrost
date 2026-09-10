@@ -157,3 +157,51 @@ test_goroutine_reuse :: proc(t: ^testing.T) {
 	testing.expectf(t, first == 10, "first batch allgs = %d, want 10", first)
 	testing.expectf(t, second == 10, "after reuse allgs = %d, want 10 (stacks should be reused)", second)
 }
+
+@(private = "file")
+starve_respawns: int
+@(private = "file")
+starve_victim_resumed_at := -1
+@(private = "file")
+STARVE_LIMIT :: 5000
+
+@(private = "file")
+starve_victim :: proc(arg: rawptr) {
+	gosched() // gosched_m -> globrunqput: the victim now lives on the GLOBAL queue
+	starve_victim_resumed_at = starve_respawns
+}
+
+@(private = "file")
+starve_respawner :: proc(arg: rawptr) {
+	starve_respawns += 1
+	if starve_respawns < STARVE_LIMIT {
+		go_(starve_respawner) // runqput: stays on the LOCAL ring, forever
+	}
+}
+
+@(test)
+test_global_runq_fairness_poll :: proc(t: ^testing.T) {
+	// Pins Go's 61-tick fairness poll (findRunnable, proc.go): "Check the global
+	// runnable queue once in a while to ensure fairness. Otherwise two
+	// goroutines can completely occupy the local runqueue by constantly
+	// respawning each other."
+	//
+	// Without it, a goroutine that yields (and so lands on the GLOBAL queue)
+	// starves behind a producer that keeps re-seeding the LOCAL ring, because
+	// findrunnable reaches the global queue only once the local ring is empty.
+	// At gomaxprocs == 1 no other M drains it, so the victim never runs.
+	starve_respawns = 0
+	starve_victim_resumed_at = -1
+	runtime_init(1)
+	defer runtime_teardown()
+	go_(starve_victim)
+	go_(starve_respawner)
+	run()
+	testing.expectf(
+		t,
+		starve_victim_resumed_at >= 0 && starve_victim_resumed_at < 200,
+		"victim resumed after respawn #%d of %d; the 61-tick poll should resume it within ~61",
+		starve_victim_resumed_at,
+		STARVE_LIMIT,
+	)
+}
