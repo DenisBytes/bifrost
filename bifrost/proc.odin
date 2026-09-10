@@ -273,15 +273,28 @@ newg :: proc(fn: proc(arg: rawptr), arg: rawptr) -> ^G {
 // then exits. Entered via gogo, so it has no incoming context — hence "c" and
 // the explicit context setup, mirroring how core:thread bootstraps a thread.
 //
-// ALLOCATOR NOTE: runtime.default_context() gives a malloc-backed heap allocator
-// (thread-safe) and Odin's default temp allocator, which is @(thread_local) —
-// so each OS thread has its own temp arena and concurrent goroutines on
-// different Ms never share one. Two real limits remain, neither hit by current
-// code paths: (1) a goroutine that temp-allocates, is stolen, and resumes on
-// another M reads the first M's arena, since context is rebuilt per OS thread,
-// not carried with the goroutine; (2) the temp arena is never reset, so it grows
-// across a long run. A per-goroutine context saved/restored across the switch is
-// deferred until a goroutine path actually uses the temp allocator (Phase 8+).
+// ALLOCATOR NOTE: runtime.default_context() gives a malloc-backed heap
+// allocator, which is thread-safe and correct for a goroutine that migrates
+// between Ms. Its temp allocator is NOT: default_context() resolves
+// `temp_allocator.data` eagerly to `&global_default_temp_allocator_data`
+// (base/runtime/core.odin:904), which is @thread_local
+// (core_builtin.odin:63), and the Context is a VALUE captured once into this
+// frame — so the pointer is frozen to whichever M first ran this goroutine and
+// then travels WITH the goroutine to every M that later resumes it. It is not
+// re-resolved per thread.
+//
+// That is the opposite of what this comment used to claim, and the consequence
+// was live rather than hypothetical: runtime.Arena's bump is a plain
+// `block.used += size` with no synchronization, so two migrated goroutines
+// sharing one M's arena were handed overlapping memory. Measured at 1067 bad
+// reads of 19,200 fmt.tprintf round-trips at gomaxprocs=8.
+//
+// Fixed by giving every G its own arena (G.temp_allocator) and installing it
+// below, which also bounds growth: goexit0 frees the blocks back when the
+// goroutine exits.
+//
+// The heap allocator is still NOT the caller's: a goroutine does not inherit the
+// context that was live at its go_ call site. See go_.
 //
 // DEVIATION: Go threads the equivalent of this trampoline through goexit as the
 // new goroutine's return address (proc.go newproc1 + asm goexit); bifrost uses
@@ -290,6 +303,11 @@ newg :: proc(fn: proc(arg: rawptr), arg: rawptr) -> ^G {
 goexit_entry :: proc "c" () {
 	context = runtime.default_context()
 	gp := getg()
+	// Replace the thread-local temp arena default_context() just baked in with
+	// THIS goroutine's own arena. See G.temp_allocator: the captured Context is
+	// a value, so the thread-local pointer would otherwise follow the goroutine
+	// onto every M it later runs on, and runtime.Arena is not thread-safe.
+	context.temp_allocator = runtime.default_temp_allocator(&gp.temp_allocator)
 	fn := gp.start_fn
 	arg := gp.start_arg
 	fn(arg)
@@ -310,6 +328,11 @@ goexit :: proc() {
 goexit0 :: proc "c" (gp: ^G) {
 	context = runtime.default_context()
 	casgstatus(gp, .Running, .Dead)
+	// Release this goroutine's temp-arena blocks. The G goes on a free list and
+	// will be reused, so without this a long-lived program accumulates one
+	// goroutine's worth of temp memory per G forever. free_all resets the arena
+	// but keeps its first block, so reuse stays cheap.
+	free_all(runtime.default_temp_allocator(&gp.temp_allocator))
 	gp.start_fn = nil
 	gp.start_arg = nil
 	gp.param = nil
@@ -1459,6 +1482,7 @@ runtime_teardown :: proc() {
 	}
 
 	for gp in allgs {
+		runtime.default_temp_allocator_destroy(&gp.temp_allocator)
 		stack_free(gp.stack)
 		free(gp, runtime_allocator)
 	}

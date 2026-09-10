@@ -1,6 +1,7 @@
 package bifrost
 
 import "base:intrinsics"
+import "core:fmt"
 import "core:mem"
 import "core:testing"
 
@@ -402,4 +403,68 @@ test_integration_non_threadsafe_allocator :: proc(t: ^testing.T) {
 	want := ARENA_ROOTS * ARENA_FANOUT
 	testing.expectf(t, arena_spawned == want, "spawned %d goroutines, want %d", arena_spawned, want)
 	testing.expectf(t, arena_done == want, "completed %d goroutines, want %d", arena_done, want)
+}
+
+// ---------------------------------------------------------------------------
+// Per-goroutine temp allocator
+// ---------------------------------------------------------------------------
+
+@(private = "file")
+TEMP_GOROUTINES :: 64
+@(private = "file")
+TEMP_ITERS :: 300
+@(private = "file")
+temp_bad: int
+@(private = "file")
+temp_checked: int
+
+@(private = "file")
+temp_worker :: proc(arg: rawptr) {
+	id := int(uintptr(arg))
+	for i in 0 ..< TEMP_ITERS {
+		// fmt.tprintf allocates from context.temp_allocator. Write a string only
+		// this goroutine could produce, yield so the scheduler can migrate us to
+		// another M, then read it back.
+		want := fmt.tprintf("goroutine-%d-iteration-%d", id, i)
+		gosched()
+		got := fmt.tprintf("goroutine-%d-iteration-%d", id, i)
+		intrinsics.atomic_add(&temp_checked, 1)
+		if got != want {
+			intrinsics.atomic_add(&temp_bad, 1)
+		}
+	}
+}
+
+@(test)
+test_integration_temp_allocator_is_per_goroutine :: proc(t: ^testing.T) {
+	// Odin's Context is a value and default_context() resolves temp_allocator.data
+	// eagerly to the @thread_local global arena, so goexit_entry's captured
+	// context froze that pointer to whichever M first ran the goroutine. After a
+	// migration, concurrent goroutines shared one M's arena — and runtime.Arena's
+	// bump is a plain non-atomic `block.used += size`, so they were handed
+	// overlapping memory. Measured before the fix: 1067 bad reads of 19,200 at
+	// gomaxprocs=8.
+	if integration_skip(t) do return
+
+	for procs in ([]i32{1, 2, 8}) {
+		temp_bad = 0
+		temp_checked = 0
+		runtime_init(procs)
+		for i in 0 ..< TEMP_GOROUTINES {
+			go_(temp_worker, rawptr(uintptr(i)))
+		}
+		run()
+		runtime_teardown()
+
+		want := TEMP_GOROUTINES * TEMP_ITERS
+		testing.expectf(t, temp_checked == want, "procs=%d: checked %d, want %d", procs, temp_checked, want)
+		testing.expectf(
+			t,
+			temp_bad == 0,
+			"procs=%d: %d of %d temp-allocated strings were corrupted by another goroutine",
+			procs,
+			temp_bad,
+			temp_checked,
+		)
+	}
 }

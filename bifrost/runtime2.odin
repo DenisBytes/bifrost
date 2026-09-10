@@ -107,6 +107,30 @@ G :: struct {
 	// has no equivalent stack-arg machinery.
 	start_fn:  proc(arg: rawptr),
 	start_arg: rawptr,
+	// temp_allocator is this goroutine's OWN temporary-allocation arena,
+	// installed into its context by goexit_entry.
+	//
+	// It must be per-G, not per-thread. Odin's Context is a VALUE, and
+	// runtime.default_context() resolves `temp_allocator.data` eagerly to
+	// `&global_default_temp_allocator_data` — which is @thread_local
+	// (base/runtime/core.odin:904, core_builtin.odin:63). goexit_entry captures
+	// the context once, into a frame on the goroutine's own stack, so without
+	// this the arena pointer is frozen to whichever M first ran the goroutine
+	// and travels with it to every other M. runtime.Arena has no
+	// synchronization (its bump is a plain `block.used += size`), so two
+	// migrated goroutines sharing one M's arena silently hand out overlapping
+	// memory: measured at 1067 corrupted fmt.tprintf results out of 19,200 at
+	// gomaxprocs=8.
+	//
+	// Go has no equivalent hazard: it has no ambient temp allocator, and its
+	// per-P mcache is re-resolved through g.m.p on every allocation rather than
+	// captured in a value.
+	//
+	// A zero value is usable: Default_Temp_Allocator wraps a runtime.Arena that
+	// allocates its first block on demand. goexit0 frees the blocks back on
+	// goroutine exit so a reused G does not accumulate, and runtime_teardown
+	// destroys it.
+	temp_allocator: runtime.Default_Temp_Allocator,
 }
 
 // Sudog ("pseudo-g") stands in for a goroutine parked on a wait queue, such as a
