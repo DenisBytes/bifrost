@@ -73,3 +73,25 @@ test_gobuf_field_offsets :: proc(t: ^testing.T) {
 	testing.expectf(t, offset_of(Gobuf, pc) == 8, "offset(pc) = %d, want 8", offset_of(Gobuf, pc))
 	testing.expectf(t, offset_of(Gobuf, bp) == 40, "offset(bp) = %d, want 40", offset_of(Gobuf, bp))
 }
+
+@(test)
+test_tls_accessors_are_the_only_writers :: proc(t: ^testing.T) {
+	// The context switch restores callee-saved registers from the suspended
+	// goroutine's own stack, so no TLS base may be cached across it — see getg's
+	// OPTIMIZATION BARRIER note. getg/getm/setg/setm carry that guarantee, and
+	// nothing else may touch tls_g/tls_m.
+	//
+	// The behavioural regression test for this is `make test-speed`: at
+	// -o:minimal the defect is latent, and at -o:speed it segfaults the
+	// multi-M scheduler. This test pins the structural half.
+	runtime_init(2)
+	defer runtime_teardown()
+
+	testing.expect(t, getg() == &g0, "getg must resolve g0 on the init thread")
+	testing.expect(t, getm() == &m0, "getm must resolve m0 on the init thread")
+
+	setg(nil)
+	testing.expect(t, getg() == nil, "setg must be the single writer of tls_g")
+	setg(&g0)
+	testing.expect(t, getg() == &g0, "setg must restore tls_g")
+}

@@ -349,8 +349,8 @@ runtime_init :: proc(procs: i32, allocator := context.allocator) {
 	allm = &m0
 
 	// This OS thread is m0, currently "running" g0 (the scheduler).
-	tls_m = &m0
-	tls_g = &g0
+	setm(&m0)
+	setg(&g0)
 
 	// Bind m0 to P0 so go_ can enqueue onto the local run queue before run()
 	// starts the scheduler. The P stays .Idle until run() marks it .Running;
@@ -361,12 +361,45 @@ runtime_init :: proc(procs: i32, allocator := context.allocator) {
 
 // getg returns the goroutine currently executing on this OS thread. Mirrors
 // Go's getg() (a compiler intrinsic reading thread-local storage).
+//
+// OPTIMIZATION BARRIER (load-bearing — do not remove the attribute): this proc
+// and its three siblings below are the ONLY code permitted to touch
+// tls_g/tls_m, and each is @(optimization_mode = "none") so the compiler cannot
+// hoist the thread-pointer read out of it and cache it in a callee-saved
+// register.
+//
+// Go does not need this because its compiler dedicates a register to g and
+// reloads it after every preemption point. bifrost cannot: its context switch
+// (asm_amd64.asm) restores callee-saved registers from the SUSPENDED
+// GOROUTINE'S OWN STACK, while the ELF TLS ABI entitles LLVM to treat the
+// thread pointer as invariant for a function activation and hoist `mov %fs:0x0`
+// into exactly those registers. A cached base then follows the goroutine onto
+// whatever M resumes it and addresses the wrong thread's TLS block — which
+// miscompiled the multi-M scheduler at every optimization level above
+// -o:minimal (examples/parallel segfaulted 10/10 at -o:speed).
+@(optimization_mode = "none")
 getg :: proc "contextless" () -> ^G {
 	return tls_g
 }
 
 // getm returns the M (OS thread abstraction) currently executing. Equivalent
-// to Go's getg().m.
+// to Go's getg().m. See getg for why this is an optimization barrier.
+@(optimization_mode = "none")
 getm :: proc "contextless" () -> ^M {
 	return tls_m
+}
+
+// setg / setm are the ONLY writers of tls_g / tls_m. Routing every write
+// through an opaque proc is what stops the compiler proving the TLS base is
+// loop- or call-invariant across a context switch. See getg.
+@(private)
+@(optimization_mode = "none")
+setg :: proc "contextless" (gp: ^G) {
+	tls_g = gp
+}
+
+@(private)
+@(optimization_mode = "none")
+setm :: proc "contextless" (mp: ^M) {
+	tls_m = mp
 }

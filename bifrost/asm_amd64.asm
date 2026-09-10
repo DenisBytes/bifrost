@@ -17,6 +17,18 @@
 ; and `bp` are recorded for debugging/dumps but the resume address travels on
 ; the stack as the final `ret` target.
 ;
+; CONSEQUENCE OF THAT CHOICE (load-bearing): because this switch preserves
+; callee-saved registers across an OS-thread change, NO thread-derived value may
+; be cached in one. The ELF TLS ABI entitles LLVM to treat the thread pointer as
+; invariant for a function activation and hoist `mov %fs:0x0` into a callee-saved
+; register; that cached base then travels with the goroutine to whatever M
+; resumes it and addresses the previous thread's TLS block. Go is immune because
+; its compiler dedicates a register to g and reloads it after every preemption
+; point; LLVM has no such notion. bifrost compensates in runtime2.odin, where
+; getg/getm/setg/setm are @(optimization_mode = "none") and are the only code
+; permitted to touch tls_g/tls_m. Removing that attribute miscompiles the
+; multi-M scheduler at every optimization level above -o:minimal.
+;
 ; Saved-frame layout, growing down from a stack's top (each slot 8 bytes):
 ;     [sp + 0]  r15      [sp + 24] r12      [sp + 48] return address (resume pc)
 ;     [sp + 8]  r14      [sp + 32] rbx

@@ -286,8 +286,8 @@ newm :: proc(pp: ^P) -> ^M {
 @(private)
 m_thread_entry :: proc(data: rawptr) {
 	mp := cast(^M)data
-	tls_m = mp
-	tls_g = mp.g0
+	setm(mp)
+	setg(mp.g0)
 	setup_context(&mp.g0.sched, cast(rawptr)mstart_run, stack_to_bytes(mp.g0_stack))
 	mp.g0.sched.g = mp.g0
 	gosave_switch(&mp.sched_return, &mp.g0.sched)
@@ -300,7 +300,7 @@ m_thread_entry :: proc(data: rawptr) {
 @(private)
 mstart_run :: proc "c" () {
 	context = runtime.default_context()
-	tls_g = getm().g0
+	setg(getm().g0)
 	schedule()
 }
 
@@ -332,7 +332,7 @@ releasep :: proc(mp: ^M) -> ^P {
 @(private)
 schedule_bootstrap :: proc "c" () {
 	context = runtime.default_context()
-	tls_g = &g0
+	setg(&g0)
 	schedule()
 }
 
@@ -522,7 +522,7 @@ execute :: proc(gp: ^G) {
 	mp.curg = gp
 	gp.m = mp
 	casgstatus(gp, .Runnable, .Running)
-	tls_g = gp
+	setg(gp)
 	gogo(&gp.sched)
 }
 
@@ -647,7 +647,7 @@ stopm :: proc() {
 mcall :: proc(fn: proc "c" (gp: ^G)) {
 	gp := getg()
 	g0p := gp.m.g0
-	tls_g = g0p
+	setg(g0p)
 	mcall_switch(&gp.sched, cast(rawptr)fn, gp, g0p.sched.sp)
 	// Resumed: execute() set tls_g back to gp before gogo'ing here.
 }
@@ -1255,8 +1255,8 @@ runtime_teardown :: proc() {
 	sched = {}
 	m0 = {}
 	g0 = {}
-	tls_g = nil
-	tls_m = nil
+	setg(nil)
+	setm(nil)
 	// Fuzzer state is a process-level global; reset it so a test that enables
 	// fuzz mode cannot silently leak that into the next test.
 	intrinsics.atomic_store(&fuzz_seed_state, u64(0))
