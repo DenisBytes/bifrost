@@ -228,3 +228,72 @@ test_select_blocking_send_woken_by_receiver :: proc(t: ^testing.T) {
 	testing.expectf(t, sel_chosen == 0, "chosen = %d, want 0", sel_chosen)
 	testing.expectf(t, sel_val == 77, "receiver got %d, want 77", sel_val)
 }
+
+@(test)
+test_select_lockorder_is_sorted_and_groups_duplicates :: proc(t: ^testing.T) {
+	// sellock/selunlock lock each distinct channel once by skipping entries equal
+	// to their neighbour, so the sort must be TOTAL (ascending by address) and
+	// must leave duplicate channels ADJACENT. A sort that failed either property
+	// would double-lock a channel — a hang — or leave one locked on return.
+	runtime_init(1)
+	defer runtime_teardown()
+
+	chans: [6]^Hchan
+	for i in 0 ..< 6 {
+		chans[i] = make_chan(size_of(int), 0)
+	}
+	defer for c in chans {destroy_chan(c)}
+
+	// Deliberately include duplicates and both directions on one channel.
+	ops := []Select_Op {
+		{c = chans[3], dir = .Recv},
+		{c = chans[0], dir = .Recv},
+		{c = chans[3], dir = .Send}, // duplicate of index 0's channel
+		{c = chans[5], dir = .Recv},
+		{c = chans[0], dir = .Send}, // duplicate of index 1's channel
+		{c = chans[1], dir = .Recv},
+		{c = chans[3], dir = .Recv}, // third copy
+		{c = chans[4], dir = .Recv},
+	}
+
+	// Reproduce select_'s ordering phases over the same input.
+	n := len(ops)
+	pollorder := make([]int, n)
+	defer delete(pollorder)
+	lockorder := make([]int, n)
+	defer delete(lockorder)
+	for i in 0 ..< n {
+		pollorder[i] = i
+	}
+	select_build_lockorder(ops, pollorder, lockorder)
+
+	for i in 1 ..< n {
+		testing.expectf(
+			t,
+			uintptr(ops[lockorder[i - 1]].c) <= uintptr(ops[lockorder[i]].c),
+			"lockorder not ascending at %d: %p then %p",
+			i,
+			ops[lockorder[i - 1]].c,
+			ops[lockorder[i]].c,
+		)
+	}
+
+	// Every case must appear exactly once.
+	seen: [8]bool
+	for o in lockorder {
+		testing.expectf(t, !seen[o], "case %d appears twice in lockorder", o)
+		seen[o] = true
+	}
+	for s, i in seen {
+		testing.expectf(t, s, "case %d missing from lockorder", i)
+	}
+
+	// Duplicates adjacent: counting distinct runs must equal the distinct count.
+	runs := 1
+	for i in 1 ..< n {
+		if ops[lockorder[i]].c != ops[lockorder[i - 1]].c {
+			runs += 1
+		}
+	}
+	testing.expectf(t, runs == 5, "distinct channel runs = %d, want 5", runs)
+}

@@ -39,8 +39,22 @@ GUARD_SIZE :: 64 * 1024
 // 32 KiB is NOT generous for stock core: code. Measured on this toolchain:
 // json.marshal costs roughly 3.5 KiB per level of struct nesting and a depth-8
 // struct overflows; fmt's %v on the same value uses about 61% of the budget.
-// Callers with deep call trees should raise this. See PLAN 3.4.
-STACK_MIN :: 32 * 1024
+//
+// It is a #config so a program with deep call trees can raise it without
+// forking the library:
+//
+//     odin build . -define:BIFROST_STACK_MIN=131072
+//
+// COST PER GOROUTINE, and the ceiling it implies: each stack is one mmap plus
+// one mprotect, and the mprotect splits the mapping, so every live goroutine
+// costs TWO kernel VMAs. Linux's default vm.max_map_count is 65530, which caps
+// live goroutines at roughly 32,700 — after which stack_alloc fails and newg
+// panics, killing the process (go_ has no error return). Dead goroutines are
+// recycled through the gfree lists rather than unmapped, so this is a
+// high-water mark, not a steady-state count. Go has no comparable limit: it
+// suballocates stacks from per-P span caches, so its VMA count is O(spans).
+// Doing the same here is recorded as follow-up work in PLAN.md.
+STACK_MIN :: #config(BIFROST_STACK_MIN, 32 * 1024)
 
 // Stack_Error reports why a goroutine stack could not be allocated.
 Stack_Error :: enum {
