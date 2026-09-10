@@ -4,10 +4,10 @@ import "base:intrinsics"
 import "core:mem"
 import "core:sync"
 
-// Channels: bifrost's port of Go's chan.go, built up across Phase 6. This file
-// (6.1) lands the wait queue and the channel header; make_chan + send/recv +
-// close arrive in 6.2-6.5, and a typed Chan(T) wrapper in 6.6. Mirrors chan.go;
-// every divergence from Go is noted at its site.
+// Channels: bifrost's port of Go's chan.go. Complete through Phase 6 — the wait
+// queue and channel header, make_chan/close_chan, unbuffered and buffered
+// send/recv, and the typed Chan(T) wrapper. Mirrors chan.go; every divergence
+// from Go is noted at its site.
 
 // Waitq is a FIFO queue of Sudogs (parked goroutines) waiting on a channel: one
 // for blocked senders (Hchan.sendq) and one for blocked receivers
@@ -20,7 +20,7 @@ Waitq :: struct {
 }
 
 // Hchan is a channel's header. For a buffered channel the dataqsiz-element ring
-// buffer is allocated immediately after this header by make_chan (Phase 6.2);
+// buffer is allocated immediately after this header by make_chan;
 // `buf` points at it. Mirrors Go's hchan (chan.go:34), reduced to the fields
 // bifrost uses; the GC/type fields (elemtype, the typed buffer) collapse to a
 // raw byte buffer plus elem_size because bifrost copies untyped bytes.
@@ -110,11 +110,36 @@ waitq_dequeue :: proc(q: ^Waitq) -> ^Sudog {
 // single-block path, and the buffer base is header-aligned (8), which suffices
 // for the byte-wise copies send/recv use.
 make_chan :: proc(elem_size: int, capacity: int, allocator := context.allocator) -> ^Hchan {
-	assert(elem_size >= 0, "make_chan: negative element size")
-	assert(elem_size < 1 << 16, "make_chan: element size too large")
-	assert(capacity >= 0, "make_chan: negative capacity")
+	// Unconditional checks, not asserts: -disable-assert strips asserts, and
+	// every one of these guards a memory-safety or type-width invariant. Go
+	// makes the equivalent checks unconditional throws in makechan (chan.go).
+	// This follows the precedent already argued at runqsteal (proc.odin).
+	if elem_size < 0 {
+		panic("make_chan: negative element size")
+	}
+	if elem_size >= 1 << 16 {
+		// Hchan.elem_size is a u16 (mirroring hchan.elemsize). A larger value
+		// would truncate here and every subsequent send/recv would copy
+		// elem_size mod 65536 bytes — silently delivering values that are
+		// partially whatever was on the receiver's stack, and completely
+		// type-invisibly through the Chan(T) wrapper.
+		panic("make_chan: element size too large (must be < 65536 bytes)")
+	}
+	if capacity < 0 {
+		panic("make_chan: negative capacity")
+	}
 
 	buf_bytes := elem_size * capacity
+	// Overflow guard, mirroring Go's `mem, overflow := math.MulUintptr(...)` in
+	// makechan (chan.go). Without it a wrapping product under-allocates the ring
+	// while dataqsiz still records the full requested capacity, so chansend
+	// always takes the "buffer has room" branch and writes past the block:
+	// make_chan(64, (1<<58)+2) allocates 128 bytes and advertises
+	// 288230376151711746 slots.
+	if capacity != 0 && buf_bytes / capacity != elem_size {
+		panic("make_chan: elem_size * capacity overflows")
+	}
+
 	block, err := mem.alloc_bytes(size_of(Hchan) + buf_bytes, align_of(Hchan), allocator)
 	if err != .None {
 		panic("make_chan: allocation failed")
@@ -130,9 +155,21 @@ make_chan :: proc(elem_size: int, capacity: int, allocator := context.allocator)
 }
 
 // destroy_chan frees a channel created by make_chan. The buffer shares the
-// header's allocation, so this is a single free. The caller must ensure no
-// goroutine is still blocked on the channel (close_chan + drain first); bifrost
-// has no GC to reclaim it otherwise.
+// header's allocation, so this is a single free.
+//
+// LIFETIME CONTRACT: destroying is safe only once every goroutine that ever
+// blocked on this channel has been observed to complete — in practice, after
+// run() has returned. Closing is NOT sufficient, and the older "close_chan +
+// drain first" advice was wrong: close_chan only makes a parked goroutine
+// runnable and gives the closer no way to observe that it has finished, and a
+// goroutine woken out of select_ re-locks the channel header (sellock),
+// dequeues its loser sudogs and unlocks — all AFTER it resumes. Freeing between
+// those two points hands that select a header which has already been recycled.
+//
+// ALLOCATOR CONTRACT: pass the same allocator make_chan was given. Letting both
+// default is not safe across the main/goroutine boundary: a goroutine runs
+// under runtime.default_context(), so `context.allocator` inside one is the
+// malloc heap regardless of what the spawner had installed (see go_).
 destroy_chan :: proc(c: ^Hchan, allocator := context.allocator) {
 	if c == nil {
 		return
@@ -207,7 +244,7 @@ close_chan :: proc(c: ^Hchan) {
 }
 
 // ---------------------------------------------------------------------------
-// Send / receive (Phase 6.3: unbuffered, synchronous handoff)
+// Send / receive: synchronous handoff and the buffered ring
 // ---------------------------------------------------------------------------
 
 // chanparkcommit is the gopark unlock callback for a goroutine blocking on a
@@ -305,7 +342,7 @@ recv :: proc(c: ^Hchan, sg: ^Sudog, ep: rawptr) {
 // chansend sends the elem_size bytes at ep on channel c. With block=true (the
 // only path exercised before select) it returns once the value is delivered or
 // panics if c is closed; the block=false probe is for Phase 7. Mirrors chansend
-// (chan.go), reduced: no race detector, timers, profiling, or buffer path (6.4).
+// (chan.go), reduced: no race detector, timers and no profiling.
 //
 // PRECONDITION: must be called from inside a goroutine started with go_, while
 // run() is active. Calling it from the thread that runs run(), or from a thread
@@ -377,7 +414,7 @@ chansend :: proc(c: ^Hchan, ep: rawptr, block: bool) -> bool {
 // the value). selected is false only for a non-blocking probe that found nothing
 // (Phase 7); received is false when the channel was closed and drained (the
 // zero value is written to ep). Mirrors chanrecv (chan.go), reduced like
-// chansend; the buffer path is Phase 6.4.
+// chansend: no race detector, timers or profiling.
 //
 // PRECONDITION: must be called from inside a goroutine started with go_, while
 // run() is active. Calling it from the thread that runs run(), or from a thread
@@ -454,7 +491,7 @@ chanrecv :: proc(c: ^Hchan, ep: rawptr, block: bool) -> (selected: bool, receive
 }
 
 // ---------------------------------------------------------------------------
-// Typed wrapper (Phase 6.6)
+// Typed wrapper
 // ---------------------------------------------------------------------------
 
 // Chan(T) is a type-safe handle over the untyped Hchan core: it carries the
@@ -468,13 +505,20 @@ Chan :: struct($T: typeid) {
 }
 
 // chan_make creates a Chan(T) with the given buffer capacity (0 = unbuffered),
-// sizing the element from T. Pair with chan_destroy.
+// sizing the element from T. Pair with chan_destroy, passing the same allocator.
+//
+// Note that inside a goroutine `context.allocator` is always
+// runtime.default_context()'s heap allocator, not the spawner's — so letting
+// this default in one place and chan_destroy default in the other is only safe
+// when both calls sit on the same side of the go_ boundary.
 chan_make :: proc($T: typeid, capacity := 0, allocator := context.allocator) -> Chan(T) {
 	return Chan(T){make_chan(size_of(T), capacity, allocator)}
 }
 
-// chan_destroy frees a Chan(T). The caller must ensure no goroutine is still
-// blocked on it (close it and let receivers drain first).
+// chan_destroy frees a Chan(T). See destroy_chan for the full lifetime and
+// allocator contract: destroy only after every goroutine that blocked on the
+// channel has completed (in practice, after run() returns), and pass the same
+// allocator chan_make was given.
 chan_destroy :: proc(ch: Chan($T), allocator := context.allocator) {
 	destroy_chan(ch.c, allocator)
 }

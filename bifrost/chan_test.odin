@@ -472,3 +472,40 @@ test_typed_chan_buffered_close :: proc(t: ^testing.T) {
 	testing.expectf(t, tch_vals[1] == 8 && tch_oks[1], "drain 2: %d ok=%v", tch_vals[1], tch_oks[1])
 	testing.expectf(t, tch_vals[2] == 0 && !tch_oks[2], "post-close: %d ok=%v, want 0/false", tch_vals[2], tch_oks[2])
 }
+
+@(test)
+test_make_chan_overflow_predicate :: proc(t: ^testing.T) {
+	// buf_bytes was a plain signed multiply while dataqsiz recorded the full
+	// requested capacity, so a wrapping product under-allocated the ring and
+	// every buffered send ran past the block. make_chan now rejects it, but the
+	// rejection is a panic (fatal, non-unwinding), so this test pins the
+	// arithmetic predicate rather than calling make_chan with the bad input.
+	elem_size := 64
+	capacity := (1 << 58) + 2
+	buf_bytes := elem_size * capacity
+	testing.expect(
+		t,
+		capacity != 0 && buf_bytes / capacity != elem_size,
+		"the overflow predicate must detect a wrapping elem_size*capacity product",
+	)
+
+	// And must not fire on ordinary sizes.
+	for es in ([]int{1, 8, 64, 4096, 65535}) {
+		for cap in ([]int{0, 1, 8, 1024}) {
+			bb := es * cap
+			overflows := cap != 0 && bb / cap != es
+			testing.expectf(t, !overflows, "false positive at elem_size=%d capacity=%d", es, cap)
+		}
+	}
+}
+
+@(test)
+test_make_chan_zero_size_elements :: proc(t: ^testing.T) {
+	// A zero-size element is legal (Go's chan struct{}{} signalling idiom) and
+	// must not be mistaken for an overflow or a bad capacity.
+	c := make_chan(0, 4)
+	defer destroy_chan(c)
+	testing.expect(t, c != nil, "make_chan(0, 4) must succeed")
+	testing.expectf(t, c.elem_size == 0, "elem_size = %d, want 0", c.elem_size)
+	testing.expectf(t, c.dataqsiz == 4, "dataqsiz = %d, want 4", c.dataqsiz)
+}
