@@ -11,8 +11,15 @@ import "base:intrinsics"
 // Mirrors sync.WaitGroup (src/sync/waitgroup.go).
 //
 // DEVIATIONS from sync.WaitGroup:
-//   - Slot widths: bifrost uses 32+32 bits (counter | waiters) for simplicity;
-//     Go uses 32+32 too but in the opposite order under a different atomic.
+//   - Slot LAYOUT matches Go exactly: counter in the high 32 bits, waiters in
+//     the low bits of one atomic u64 (sync/waitgroup.go:48-56). An earlier
+//     version of this comment claimed Go used "the opposite order"; it does not.
+//     The real layout deviation is that Go reserves bit 32 as a synctest-bubble
+//     flag and masks the wait count to 31 bits, whereas bifrost has no synctest
+//     and uses the full low 32.
+//   - Go updates the state with Add plus a plain Store on the fast paths;
+//     bifrost uses a full-word CAS loop throughout. Simpler to reason about,
+//     marginally more contended.
 //   - Reuse detection is best-effort: waitgroup_wait panics if it observes a
 //     non-zero counter immediately after wake, but a Wait/Add interleaving that
 //     completes between the wake and the load isn't caught. Go has a more

@@ -1,5 +1,6 @@
 package bifrost
 
+import "base:intrinsics"
 import "core:testing"
 
 // Phase 8.5 unit tests for RWMutex. Mutual exclusion under contention is the
@@ -93,4 +94,30 @@ test_rwmutex_multiple_readers_concurrent :: proc(t: ^testing.T) {
 	run()
 
 	testing.expect(t, rw_both_held, "two RLocks did not overlap — reader-reader exclusion incorrectly imposed")
+}
+
+@(test)
+test_rwmutex_uninitialized_writer_is_detected :: proc(t: ^testing.T) {
+	// A zero-value RWMutex is NOT usable (unlike sync.RWMutex), and the failure
+	// is asymmetric: the read side works fine, so the miss only surfaces at the
+	// first writer, which blocks forever on a mutex nobody holds. rwmutex_lock
+	// detects it — the panic itself is fatal and non-unwinding, so this asserts
+	// the predicate that fires it.
+	fresh: RWMutex // deliberately NOT rwmutex_init'd
+	uninitialized :=
+		intrinsics.atomic_load(&fresh.w.sema) == 0 &&
+		intrinsics.atomic_load(&fresh.reader_count) == 0
+	testing.expect(t, uninitialized, "a zero-value RWMutex must be detectable as uninitialized")
+
+	// And an initialized one must not trip the same check.
+	rwmutex_init(&fresh)
+	tripped :=
+		intrinsics.atomic_load(&fresh.w.sema) == 0 &&
+		intrinsics.atomic_load(&fresh.reader_count) == 0
+	testing.expect(t, !tripped, "rwmutex_init must clear the uninitialized signature")
+
+	// The read side works on a zero value, which is exactly why the miss hides.
+	zero: RWMutex
+	rwmutex_rlock(&zero)
+	rwmutex_runlock(&zero)
 }

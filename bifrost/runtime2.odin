@@ -155,8 +155,10 @@ Sudog :: struct {
 	// where to receive into. It may point into the parked goroutine's own stack —
 	// the synchronous "direct send" handoff copies through it. Mirrors sudog.elem.
 	elem: rawptr,
-	// isSelect marks a Sudog enqueued by a select (Phase 7); the dequeue wake-race
-	// resolution keys off it. Always false until then.
+	// isSelect marks a Sudog enqueued by a select; the dequeue wake-race
+	// resolution in waitq_dequeue keys off it. select_ sets it on every case it
+	// enqueues and clears it in pass 3 before release_sudog; every other path
+	// leaves it false.
 	isSelect: bool,
 	// success records how the goroutine was woken: true if a value was
 	// communicated over c, false if c was closed. Read by the goroutine after it

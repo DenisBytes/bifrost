@@ -20,10 +20,14 @@ import "core:time"
 //     periodic timers (Go's `period` field) are not yet supported.
 //   - No timerproc / netpoller integration; firing happens in the scheduler.
 //   - Firing latency floor is PARK_TIMEOUT (200µs): on an otherwise idle
-//     runtime an M re-polls timers only when its park sema times out. Go's
-//     stopm computes time-until-next-timer and parks for exactly that long
-//     (proc.go pollUntil / checkTimers); bifrost uses the simpler polling
-//     approach. Sleeps shorter than PARK_TIMEOUT still meet the "≥ d" contract
+//     runtime an M re-polls timers only when its park sema times out.
+//     DEVIATION, stated correctly: Go's stopm/mPark parks UNTIMED on a note
+//     (proc.go stopm, notesleep). What bounds the wait there is findRunnable
+//     computing pollUntil from the per-P timer heaps and passing it as the
+//     netpoll(delay) deadline, with a newly added earlier timer breaking the
+//     wait via wakeNetPoller; absent a netpoller, sysmon's
+//     timeSleepUntil()-bounded notetsleep does the waking. bifrost has neither a
+//     netpoller nor sysmon, so it uses a fixed poll interval instead. Sleeps shorter than PARK_TIMEOUT still meet the "≥ d" contract
 //     but typically observe ~PARK_TIMEOUT latency.
 
 // Timer is a one-shot scheduled callback. `deadline` is the firing time in

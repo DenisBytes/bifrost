@@ -526,7 +526,7 @@ wakep :: proc() {
 }
 
 // mput pushes mp onto the idle-M LIFO and runs the deadlock check. Caller must
-// hold sched.lock. Mirrors Go's mput (proc.go:7230), which likewise calls
+// hold sched.lock. Mirrors Go's mput (proc.go:7244), which likewise calls
 // checkdead under the lock.
 @(private)
 mput :: proc(mp: ^M) {
@@ -537,7 +537,7 @@ mput :: proc(mp: ^M) {
 }
 
 // mget pops one idle M off the LIFO, or nil. Caller must hold sched.lock.
-// Mirrors Go's mget (proc.go:7243).
+// Mirrors Go's mget (proc.go:7257).
 @(private)
 mget :: proc() -> ^M {
 	mp := sched.midle
@@ -551,7 +551,7 @@ mget :: proc() -> ^M {
 
 // mget_specific removes mp from the idle list if present (no-op otherwise), so an
 // M that woke on its PARK_TIMEOUT can delist itself. Caller must hold sched.lock.
-// Mirrors Go's mgetSpecific (proc.go:7260).
+// Mirrors Go's mgetSpecific (proc.go:7274).
 //
 // DEVIATION: Go's mgetSpecific is O(1) — its idle list is an intrusive
 // doubly-linked list and membership is a prev/next == 0 test. bifrost's midle is
@@ -579,7 +579,7 @@ mget_specific :: proc(mp: ^M) {
 // checkdead reports a genuine deadlock: every M parked while live goroutines
 // remain, all of them _Gwaiting with no one left to wake them. Caller must hold
 // sched.lock; called from mput when an M parks. Mirrors Go's checkdead
-// (proc.go:6397).
+// (proc.go:6411).
 //
 // LOCK ORDER: this takes allgs_lock while already holding sched.lock, so the
 // ordering is sched.lock -> allgs_lock. Nothing may take them in the reverse
@@ -1006,7 +1006,7 @@ runqput :: proc(pp: ^P, gp: ^G, next: bool) {
 
 // runqputslow moves half of P's full local run queue, plus gp, to the global
 // queue. Returns false if a concurrent steal advanced runqhead (caller retries).
-// Mirrors runqputslow (proc.go:7554).
+// Mirrors runqputslow (proc.go:7568).
 @(private)
 runqputslow :: proc(pp: ^P, gp: ^G, h, t: u32) -> bool {
 	n := (t - h) / 2
@@ -1034,7 +1034,7 @@ runqputslow :: proc(pp: ^P, gp: ^G, h, t: u32) -> bool {
 }
 
 // runqget pops the next goroutine from P's local run queue (runnext first, then
-// the ring). Called by the owner P. Mirrors runqget (proc.go:7628).
+// the ring). Called by the owner P. Mirrors runqget (proc.go:7642).
 @(private)
 runqget :: proc(pp: ^P) -> ^G {
 	if next := intrinsics.atomic_load_explicit(&pp.runnext, .Acquire); next != nil {
@@ -1125,7 +1125,7 @@ runqsteal :: proc(pp: ^P, victim: ^P, steal_runnext: bool) -> ^G {
 }
 
 // globrunqput appends one goroutine to the global run queue (under sched.lock).
-// Mirrors globrunqput (proc.go:7279).
+// Mirrors globrunqput (proc.go:7293).
 @(private)
 globrunqput :: proc(gp: ^G) {
 	gp.schedlink = nil
@@ -1133,7 +1133,7 @@ globrunqput :: proc(gp: ^G) {
 }
 
 // globrunqputbatch appends a pre-linked chain [head..tail] of n goroutines to
-// the global run queue under sched.lock. Mirrors globrunqputbatch (proc.go:7302).
+// the global run queue under sched.lock. Mirrors globrunqputbatch (proc.go:7316).
 //
 // DEVIATION: Go requires the caller to already hold sched.lock; bifrost's
 // global-queue ops are self-locking for simplicity (no nested lock sites).
@@ -1154,7 +1154,7 @@ globrunqputbatch :: proc(head, tail: ^G, n: i32) {
 }
 
 // globrunqget pops one goroutine from the global run queue (under sched.lock).
-// Mirrors globrunqget (proc.go:7311). When the deterministic fuzzer is active
+// Mirrors globrunqget (proc.go:7325). When the deterministic fuzzer is active
 // (runtime_set_fuzz_seed), the pick is a pseudo-random index in the queue
 // rather than the FIFO head — this is the perturbation surface that the fuzzer
 // uses to explore non-FIFO interleavings under a reproducible seed. NOTE: this

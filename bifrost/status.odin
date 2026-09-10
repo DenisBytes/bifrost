@@ -11,7 +11,7 @@ import "core:fmt"
 // _Gsyscall and 5 for the unused _Gmoribund slot, which bifrost does not use
 // yet. Backed by u32 to match Go's atomic.Uint32 and to allow atomic CAS.
 G_Status :: enum u32 {
-	Idle     = 0, // _Grunnable just allocated, not yet initialized.
+	Idle     = 0, // _Gidle just allocated, not yet initialized.
 	Runnable = 1, // _Grunnable on a run queue, not executing.
 	Running  = 2, // _Grunning executing user code; owns its stack.
 	Waiting  = 4, // _Gwaiting blocked in the runtime (3 == _Gsyscall, later).

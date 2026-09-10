@@ -323,7 +323,11 @@ select_ :: proc(ops: []Select_Op, block: bool) -> (chosen: int, recv_ok: bool) {
 
 	// Pass 3: walk gp.waiting (lock order) alongside lockorder. Clear per-Sudog
 	// state first, then for each: the winner was already dequeued by its waker
-	// (just record it); every loser is still enqueued and must be removed.
+	// (just record it); each loser is either still enqueued, or was already
+	// unlinked by a waker that popped it and then LOST the select_done CAS.
+	// dequeue_sudog handles both — which is exactly why its x == y == nil branch
+	// has to disambiguate on q.first rather than assume the sudog is the only
+	// element.
 	for sg1 := gp.waiting; sg1 != nil; sg1 = sg1.waitlink {
 		sg1.isSelect = false
 		sg1.elem = nil

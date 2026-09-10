@@ -13,9 +13,17 @@ import "base:intrinsics"
 // writer-pending state count down reader_wait; the last one wakes the writer
 // on writer_sem.
 //
-// DEVIATION from sync.RWMutex: bifrost has no -race or reentrant-RLock
-// detection. Caller contracts (one RUnlock per RLock; no recursive RLock from
-// the same goroutine while a writer is queued) match Go's documentation.
+// DEVIATIONS from sync.RWMutex:
+//   - REQUIRES rwmutex_init. Go's RWMutex is zero-value-usable; bifrost's is
+//     not, because it embeds a Mutex whose zero value reads as HELD (see
+//     mutex.odin). The failure is asymmetric and therefore easy to miss:
+//     rwmutex_rlock/rwmutex_runlock work perfectly on a zero value — they only
+//     touch reader_count — so an uninitialized RWMutex behaves correctly right
+//     up until the first writer, which then blocks forever on a mutex nobody
+//     holds. rwmutex_lock detects that case and says so.
+//   - No -race and no reentrant-RLock detection. The caller contracts (one
+//     RUnlock per RLock; no recursive RLock from the same goroutine while a
+//     writer is queued) match Go's documentation.
 
 @(private)
 RW_MAX_READERS :: i32(1 << 30)
@@ -34,6 +42,9 @@ RWMutex :: struct {
 	reader_wait: i32,
 }
 
+// rwmutex_init prepares rw for use. It MUST be called before any rlock/lock:
+// the embedded write Mutex's zero value reads as held, so an uninitialized
+// RWMutex silently accepts readers and then deadlocks the first writer.
 rwmutex_init :: proc(rw: ^RWMutex) {
 	mutex_init(&rw.w)
 	rw.reader_sem = 0
@@ -89,6 +100,16 @@ rwmutex_runlock_slow :: proc(rw: ^RWMutex, r: i32) {
 // run() is active. Calling it from the thread that runs run(), or from a thread
 // bifrost did not create, panics with a diagnostic rather than faulting (mcall).
 rwmutex_lock :: proc(rw: ^RWMutex) {
+	// Catch the missing rwmutex_init. A zero-value RWMutex has w.sema == 0,
+	// which the Mutex encoding reads as "held", so this would otherwise block
+	// forever on a lock no goroutine owns — and because the read side works fine
+	// on a zero value, that is the first symptom the caller ever sees. An
+	// initialized-and-genuinely-contended RWMutex always has either a permit
+	// available or a live reader count, so this cannot false-positive on a
+	// correctly initialized one.
+	if intrinsics.atomic_load(&rw.w.sema) == 0 && intrinsics.atomic_load(&rw.reader_count) == 0 {
+		panic("bifrost: rwmutex_lock on an uninitialized RWMutex — call rwmutex_init first")
+	}
 	// Exclude other writers first.
 	mutex_lock(&rw.w)
 	// Signal pending writer to readers by negating reader_count: readers seeing

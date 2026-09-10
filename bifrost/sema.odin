@@ -41,8 +41,16 @@ Sema_Root :: struct {
 @(private)
 sema_table: [SEMA_TABLE_SIZE]Sema_Root
 
-// sema_root_for hashes addr to its bucket. The >> 3 ignores low alignment bits
-// so addresses spaced by sizeof(u32) don't all collide on one root.
+// sema_root_for hashes addr to its bucket, mirroring Go's semTable.rootFor
+// (sema.go:56): `(uintptr(addr) >> 3) % semTabSize`.
+//
+// The >> 3 drops the three always-zero low bits of the 8-byte-aligned addresses
+// Go hashes. NOTE, because an earlier version of this comment had the reasoning
+// backwards: the shift does not improve spread for 4-byte-spaced addresses, it
+// WORSENS it. bifrost's Mutex is a bare u32, so two Mutexes 4 bytes apart — an
+// array of them, or adjacent struct fields — hash to the same root in pairs.
+// That is a contention concern, not a correctness one: the root's FIFO matches
+// waiters by addr, so a collision only means sharing a lock.
 @(private)
 sema_root_for :: proc "contextless" (addr: ^u32) -> ^Sema_Root {
 	return &sema_table[(uintptr(addr) >> 3) % SEMA_TABLE_SIZE]
