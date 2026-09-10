@@ -24,6 +24,10 @@ once_init :: proc(o: ^Once) {
 
 // once_do runs fn exactly once per Once, regardless of how many callers
 // invoke it. Other callers block until the running call finishes, then return.
+//
+// PRECONDITION: must be called from inside a goroutine started with go_, while
+// run() is active. Calling it from the thread that runs run(), or from a thread
+// bifrost did not create, panics with a diagnostic rather than faulting (mcall).
 once_do :: proc(o: ^Once, fn: proc()) {
 	// Fast path: if we've already run, no lock, no work. The seq-cst load here
 	// synchronizes-with the seq-cst store in once_do_slow's defer, so fn's

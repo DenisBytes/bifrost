@@ -127,11 +127,17 @@ timer_run_expired :: proc(pp: ^P) {
 
 // time_sleep blocks the current goroutine until at least d has elapsed.
 // Mirrors timeSleep (runtime/time.go).
+//
+// PRECONDITION: must be called from inside a goroutine started with go_, while
+// run() is active. Calling it from the thread that runs run(), or from a thread
+// bifrost did not create, panics with a diagnostic rather than faulting (mcall).
 time_sleep :: proc(d: time.Duration) {
 	if d <= 0 {
 		return
 	}
-	assert(allp != nil, "bifrost: call runtime_init before time_sleep")
+	if allp == nil {
+		panic("bifrost: call runtime_init before time_sleep")
+	}
 	gp := getg()
 	pp := getm().p
 	deadline := mono_now_ns() + i64(d)
@@ -171,7 +177,9 @@ time_sleep_wake :: proc(arg: rawptr) {
 // when the timeout case was the one chosen — otherwise drain the timeout chan
 // first to ensure the callback has run. A timer-cancel API is a follow-up.
 time_after :: proc(d: time.Duration) -> Chan(i64) {
-	assert(allp != nil, "bifrost: call runtime_init before time_after")
+	if allp == nil {
+		panic("bifrost: call runtime_init before time_after")
+	}
 	ch := chan_make(i64, 1)
 	pp := getm().p
 	deadline := mono_now_ns() + i64(d)

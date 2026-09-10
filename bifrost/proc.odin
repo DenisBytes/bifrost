@@ -52,12 +52,53 @@ PARK_TIMEOUT :: 200 * time.Microsecond
 // Public API
 // ---------------------------------------------------------------------------
 
+// on_goroutine reports whether the caller is executing on a user goroutine of
+// an initialized runtime — i.e. whether a blocking runtime call is legal here.
+//
+// It is false on three distinct misuses, each of which otherwise crashes with
+// no diagnostic:
+//  1. a thread bifrost never created — tls_m is @(thread_local), so getm() is
+//     nil there and every entry point nil-derefs;
+//  2. the thread that called run(), which is m0 running g0, not a goroutine;
+//  3. any call before runtime_init.
+@(private)
+on_goroutine :: proc "contextless" () -> bool {
+	mp := getm()
+	gp := getg()
+	return allp != nil && mp != nil && gp != nil && mp.g0 != nil && gp != mp.g0
+}
+
 // go_ spawns a new goroutine running fn(arg). It is bifrost's equivalent of
 // Go's `go fn(arg)`. The goroutine becomes runnable immediately but does not
 // run until the scheduler (run) is active and reaches it. Mirrors newproc
 // (proc.go).
+//
+// CONTRACT: callable from the thread that ran runtime_init (before or during
+// run) and from inside any goroutine. NOT callable from a thread bifrost did
+// not create — see on_goroutine.
+//
+// ALLOCATOR: the new goroutine runs under runtime.default_context(), NOT the
+// caller's context. Its `context.allocator` is therefore the malloc heap
+// regardless of what the caller had installed, so memory a goroutine allocates
+// must not be freed with a caller-side allocator (and vice versa). See
+// goexit_entry.
 go_ :: proc(fn: proc(arg: rawptr), arg: rawptr = nil) {
-	assert(allp != nil, "bifrost: call runtime_init before go_")
+	// Unconditional checks, not asserts: -disable-assert strips asserts, and
+	// each of these otherwise ends in a bare SIGSEGV. Go's newproc1 likewise
+	// fatals rather than faulting.
+	if allp == nil {
+		panic("bifrost: call runtime_init before go_")
+	}
+	if getm() == nil {
+		panic(
+			"bifrost: go_ called from a thread the runtime does not own. bifrost APIs are " +
+			"callable from the thread that ran runtime_init, or from inside a goroutine — " +
+			"not from an arbitrary core:thread thread.",
+		)
+	}
+	if fn == nil {
+		panic("bifrost: go_ of nil proc value")
+	}
 	gp := newg(fn, arg)
 	// Enqueue onto the current M's P (allp[0] for the main thread before run).
 	runqput(getm().p, gp, true)
@@ -69,7 +110,12 @@ go_ :: proc(fn: proc(arg: rawptr), arg: rawptr = nil) {
 // run. It spins up gomaxprocs-1 worker Ms (one per P beyond P0), runs m0's own
 // schedule loop on P0, and on shutdown joins the workers before returning.
 run :: proc() {
-	assert(allp != nil, "bifrost: call runtime_init before run")
+	// Unconditional, not an assert: -disable-assert strips asserts and this
+	// would then nil-deref allp inside scheduler_start instead of naming the
+	// misuse. Same reasoning as go_ and mcall.
+	if allp == nil {
+		panic("bifrost: call runtime_init before run")
+	}
 	scheduler_start()
 
 	// Spin up one worker M per P beyond P0; each runs schedule() on its own
@@ -95,6 +141,10 @@ run :: proc() {
 
 // gosched yields the processor, allowing other goroutines to run, and resumes
 // the caller later. Mirrors Go's Gosched (proc.go:393).
+//
+// PRECONDITION: must be called from inside a goroutine started with go_, while
+// run() is active. Calling it from the thread that runs run(), or from a thread
+// bifrost did not create, panics with a diagnostic rather than faulting (mcall).
 gosched :: proc() {
 	mcall(gosched_m)
 }
@@ -105,6 +155,10 @@ gosched :: proc() {
 // the park is aborted and the goroutine resumes. The goroutine stays parked
 // until some other goroutine calls goready on it. Mirrors gopark
 // (proc.go:449).
+//
+// PRECONDITION: must be called from inside a goroutine started with go_, while
+// run() is active. Calling it from the thread that runs run(), or from a thread
+// bifrost did not create, panics with a diagnostic rather than faulting (mcall).
 gopark :: proc(unlockf: proc "c" (gp: ^G, lock: rawptr) -> bool, lock: rawptr, reason: Wait_Reason) {
 	gp := getg()
 	mp := getm()
@@ -663,6 +717,30 @@ stopm :: proc() {
 // operands; the stack switch itself is mcall_switch (asm_amd64.asm).
 @(private)
 mcall :: proc(fn: proc "c" (gp: ^G)) {
+	// Go's mcall refuses to run when the current g is already g0 (asm_amd64.s:
+	// `CMPQ SI, R14 / JNE goodm / JMP runtime·badmcall`, throwing "runtime:
+	// mcall called on m->g0 stack" via badmcall in proc.go). bifrost needs the
+	// same guard for a sharper reason: on the thread that calls run(), getg()
+	// IS g0, so &gp.sched and g0p.sched would be the same buffer — and before
+	// run() has installed a bootstrap frame, g0.sched.sp is still 0 (runtime_init
+	// zeroes g0), so mcall_switch would execute `mov rsp, 0` followed by `call`.
+	// That is an immediate SIGSEGV with no output, reachable from an ordinary
+	// chan_recv on the main thread.
+	//
+	// This is one choke point for every blocking public API: gosched, gopark and
+	// goexit all funnel through here, and everything else (channels, select,
+	// sema and therefore Mutex/RWMutex/WaitGroup/Once/Cond, time_sleep) funnels
+	// through those. Unconditional panic, not assert: -disable-assert would
+	// strip an assert and restore the silent segfault.
+	if !on_goroutine() {
+		panic(
+			"bifrost: blocking runtime call outside a goroutine. chan_send, chan_recv, " +
+			"select_, mutex_lock, rwmutex_lock, waitgroup_wait, cond_wait, sema_acquire, " +
+			"time_sleep and gosched may only be called from inside a goroutine started with " +
+			"go_, while run() is active — not from the thread that calls run(), and not from " +
+			"a thread bifrost did not create.",
+		)
+	}
 	gp := getg()
 	g0p := gp.m.g0
 	setg(g0p)

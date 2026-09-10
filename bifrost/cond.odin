@@ -56,6 +56,10 @@ cond_init :: proc(c: ^Cond) {
 // the mutex released also sees the incremented waiter count and will sema_post.
 // Odin's default-seq-cst atomics + the mutex's release/acquire give us that
 // ordering without an explicit fence.
+//
+// PRECONDITION: must be called from inside a goroutine started with go_, while
+// run() is active. Calling it from the thread that runs run(), or from a thread
+// bifrost did not create, panics with a diagnostic rather than faulting (mcall).
 cond_wait :: proc(c: ^Cond, m: ^Mutex) {
 	intrinsics.atomic_add(&c.waiters, i32(1))
 	mutex_unlock(m)

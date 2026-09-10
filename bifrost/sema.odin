@@ -117,6 +117,10 @@ sema_dequeue :: proc(root: ^Sema_Root, addr: ^u32) -> ^Sudog {
 // sema_acquire blocks until *addr > 0 and atomically decrements it. Cheap when
 // uncontended (a single CAS); the slow path enqueues a Sudog and parks.
 // Mirrors semacquire1 (sema.go:146).
+//
+// PRECONDITION: must be called from inside a goroutine started with go_, while
+// run() is active. Calling it from the thread that runs run(), or from a thread
+// bifrost did not create, panics with a diagnostic rather than faulting (mcall).
 sema_acquire :: proc(addr: ^u32) {
 	// Easy case: a permit is already available; no lock, no sudog, no park.
 	if cansemacquire(addr) {

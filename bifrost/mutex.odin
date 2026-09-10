@@ -29,6 +29,10 @@ mutex_init :: proc(m: ^Mutex) {
 }
 
 // mutex_lock acquires the lock, blocking until it is available.
+//
+// PRECONDITION: must be called from inside a goroutine started with go_, while
+// run() is active. Calling it from the thread that runs run(), or from a thread
+// bifrost did not create, panics with a diagnostic rather than faulting (mcall).
 mutex_lock :: proc(m: ^Mutex) {
 	sema_acquire(&m.sema)
 }

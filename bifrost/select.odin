@@ -124,6 +124,10 @@ dequeue_sudog :: proc(q: ^Waitq, sgp: ^Sudog) {
 // ops of the case that ran; recv_ok reports, for a receive, whether a value was
 // received (false if the channel was closed). Mirrors selectgo (select.go:122),
 // reduced: no race detector, timers, profiling, or synctest.
+//
+// PRECONDITION: must be called from inside a goroutine started with go_, while
+// run() is active. Calling it from the thread that runs run(), or from a thread
+// bifrost did not create, panics with a diagnostic rather than faulting (mcall).
 select_ :: proc(ops: []Select_Op, block: bool) -> (chosen: int, recv_ok: bool) {
 	gp := getg()
 	ncases := len(ops)

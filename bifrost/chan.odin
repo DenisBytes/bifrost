@@ -306,6 +306,10 @@ recv :: proc(c: ^Hchan, sg: ^Sudog, ep: rawptr) {
 // only path exercised before select) it returns once the value is delivered or
 // panics if c is closed; the block=false probe is for Phase 7. Mirrors chansend
 // (chan.go), reduced: no race detector, timers, profiling, or buffer path (6.4).
+//
+// PRECONDITION: must be called from inside a goroutine started with go_, while
+// run() is active. Calling it from the thread that runs run(), or from a thread
+// bifrost did not create, panics with a diagnostic rather than faulting (mcall).
 chansend :: proc(c: ^Hchan, ep: rawptr, block: bool) -> bool {
 	if c == nil {
 		if !block {
@@ -374,6 +378,10 @@ chansend :: proc(c: ^Hchan, ep: rawptr, block: bool) -> bool {
 // (Phase 7); received is false when the channel was closed and drained (the
 // zero value is written to ep). Mirrors chanrecv (chan.go), reduced like
 // chansend; the buffer path is Phase 6.4.
+//
+// PRECONDITION: must be called from inside a goroutine started with go_, while
+// run() is active. Calling it from the thread that runs run(), or from a thread
+// bifrost did not create, panics with a diagnostic rather than faulting (mcall).
 chanrecv :: proc(c: ^Hchan, ep: rawptr, block: bool) -> (selected: bool, received: bool) {
 	if c == nil {
 		if !block {
@@ -473,6 +481,10 @@ chan_destroy :: proc(ch: Chan($T), allocator := context.allocator) {
 
 // chan_send sends v on ch, blocking until a receiver takes it (or buffer room
 // exists). Panics if ch is closed.
+//
+// PRECONDITION: must be called from inside a goroutine started with go_, while
+// run() is active. Calling it from the thread that runs run(), or from a thread
+// bifrost did not create, panics with a diagnostic rather than faulting (mcall).
 chan_send :: proc(ch: Chan($T), v: T) {
 	v := v // a local whose address is stable for the byte copy
 	chansend(ch.c, &v, true)
@@ -480,6 +492,10 @@ chan_send :: proc(ch: Chan($T), v: T) {
 
 // chan_recv receives the next value from ch. ok is false when the channel is
 // closed and drained, in which case value is the zero value of T.
+//
+// PRECONDITION: must be called from inside a goroutine started with go_, while
+// run() is active. Calling it from the thread that runs run(), or from a thread
+// bifrost did not create, panics with a diagnostic rather than faulting (mcall).
 chan_recv :: proc(ch: Chan($T)) -> (value: T, ok: bool) {
 	_, ok = chanrecv(ch.c, &value, true)
 	return

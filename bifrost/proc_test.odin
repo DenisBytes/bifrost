@@ -205,3 +205,34 @@ test_global_runq_fairness_poll :: proc(t: ^testing.T) {
 		STARVE_LIMIT,
 	)
 }
+
+@(private = "file")
+on_goroutine_observed: bool
+
+@(private = "file")
+check_on_goroutine :: proc(arg: rawptr) {
+	on_goroutine_observed = on_goroutine()
+}
+
+@(test)
+test_on_goroutine_predicate :: proc(t: ^testing.T) {
+	// on_goroutine gates every blocking public API (see mcall). It must be false
+	// on the thread that runs run() — that thread is m0 executing g0, and mcall
+	// there would pass &g0.sched as both the save buffer and the destination
+	// stack, with g0.sched.sp still 0 before run(): `mov rsp, 0` then `call`.
+	//
+	// The panic paths themselves cannot be unit-tested, because an Odin panic is
+	// fatal and does not unwind; they are exercised as subprocesses instead.
+	testing.expect(t, !on_goroutine(), "no runtime yet: on_goroutine must be false")
+
+	runtime_init(1)
+	defer runtime_teardown()
+	testing.expect(t, !on_goroutine(), "on g0 before run(): on_goroutine must be false")
+
+	on_goroutine_observed = false
+	go_(check_on_goroutine)
+	run()
+	testing.expect(t, on_goroutine_observed, "inside a goroutine: on_goroutine must be true")
+
+	testing.expect(t, !on_goroutine(), "back on g0 after run(): on_goroutine must be false")
+}

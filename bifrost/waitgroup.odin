@@ -71,6 +71,10 @@ waitgroup_done :: proc(wg: ^WaitGroup) {
 // waitgroup_wait blocks until the counter is 0. Returns immediately if it is
 // already 0. Panics if a fresh Add cycle slips in between the wake and the
 // reuse check (best-effort detection).
+//
+// PRECONDITION: must be called from inside a goroutine started with go_, while
+// run() is active. Calling it from the thread that runs run(), or from a thread
+// bifrost did not create, panics with a diagnostic rather than faulting (mcall).
 waitgroup_wait :: proc(wg: ^WaitGroup) {
 	for {
 		state := intrinsics.atomic_load(&wg.state)

@@ -45,6 +45,10 @@ rwmutex_init :: proc(rw: ^RWMutex) {
 // rwmutex_rlock acquires a read lock. Multiple readers may hold the lock
 // simultaneously; if a writer holds (or is queued for) the lock the call
 // blocks until the writer releases. Mirrors (*RWMutex).RLock (rwmutex.go:67).
+//
+// PRECONDITION: must be called from inside a goroutine started with go_, while
+// run() is active. Calling it from the thread that runs run(), or from a thread
+// bifrost did not create, panics with a diagnostic rather than faulting (mcall).
 rwmutex_rlock :: proc(rw: ^RWMutex) {
 	// intrinsics.atomic_add returns OLD; new = old + 1. New < 0 (writer pending).
 	if intrinsics.atomic_add(&rw.reader_count, i32(1)) + 1 < 0 {
@@ -80,6 +84,10 @@ rwmutex_runlock_slow :: proc(rw: ^RWMutex, r: i32) {
 
 // rwmutex_lock acquires the write lock, blocking until all readers have left
 // and any other writer has released. Mirrors (*RWMutex).Lock (rwmutex.go:144).
+//
+// PRECONDITION: must be called from inside a goroutine started with go_, while
+// run() is active. Calling it from the thread that runs run(), or from a thread
+// bifrost did not create, panics with a diagnostic rather than faulting (mcall).
 rwmutex_lock :: proc(rw: ^RWMutex) {
 	// Exclude other writers first.
 	mutex_lock(&rw.w)
