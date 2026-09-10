@@ -8,8 +8,14 @@ on:
 jobs:
   check:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
+      # nasm is required even for `odin check`: the bifrost package
+      # foreign-imports asm_amd64.asm, so the assembler must be present for the
+      # import to resolve. This job previously omitted it.
+      - name: Install NASM
+        run: sudo apt-get update && sudo apt-get install -y nasm
       - name: Set up Odin
         uses: laytan/setup-odin@v2
         with:
@@ -17,5 +23,6 @@ jobs:
           release: nightly
       - name: odin version
         run: odin version
-      - name: odin check
+      # make check covers the library AND every example.
+      - name: make check
         run: make check

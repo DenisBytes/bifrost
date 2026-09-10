@@ -98,12 +98,26 @@ Naming mirrors the user's Odin style (see `/home/denisbytes/dev/kafka-odin`):
   register helpers if ever needed.
 
 ## Building, testing, running
-- `make check` — `odin check bifrost -vet -strict-style`. This is the style
-  gate (the toolchain ships no `odin fmt`).
+- `make check` — `odin check <pkg> -vet -vet-tabs -strict-style -no-entry-point`
+  over the library, plus the same check (without `-no-entry-point`) over every
+  example. This is the style gate: the toolchain ships no `odin fmt`, so
+  `-strict-style` (brace placement, stray tokens, trailing commas) plus
+  `-vet-tabs` (tab indentation) is what CI enforces. `-no-entry-point` is
+  required for the library — without it the check fails with "Undefined entry
+  point procedure 'main'".
 - `make test` — colocated `*_test.odin` unit tests (`core:testing`,
-  `@(test)`).
+  `@(test)`), with `ODIN_TEST_FAIL_ON_BAD_MEMORY=true` so a leak fails the run.
 - `make test-integration` — heavier stress tests, gated on
   `BIFROST_INTEGRATION=1` (mirrors kafka-odin's integration pattern).
+- `make test-speed` / `make test-size` — the same suites at `-o:speed` /
+  `-o:size`. **These are merge gates, not extras.** The context switch preserves
+  callee-saved registers across an OS-thread change, so the runtime is sensitive
+  to what the optimizer caches in one; a green run at Odin's default
+  `-o:minimal` is not evidence that a release build works. Shipping without this
+  gate is how the TLS thread-pointer defect survived behind a green `main`.
+- `make examples-speed` — builds *and runs* every example at `-o:speed`.
+  Building alone is insufficient; the defect above linked cleanly and
+  segfaulted at run time.
 - `make build` — type-check + compile every example into `./bin`.
 - `make run-example EXAMPLE=hello` — build and run one example.
 - Requires the Odin nightly compiler and `nasm` (for the context-switch

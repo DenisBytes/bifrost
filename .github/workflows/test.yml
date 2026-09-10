@@ -6,8 +6,20 @@ on:
   pull_request:
 
 jobs:
-  unit:
+  test:
     runs-on: ubuntu-latest
+    # A bifrost deadlock at gomaxprocs >= 2 hangs `odin test` rather than
+    # failing it, so without an explicit timeout a regression burns the full
+    # 360-minute default before anyone sees it.
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        # The optimization axis is a merge gate. bifrost's hand-rolled context
+        # switch preserves callee-saved registers across an OS-thread change, so
+        # it is sensitive to what the optimizer caches in one; a green run at
+        # Odin's default -o:minimal is not evidence a release build works.
+        opt: ["", "-o:speed", "-o:size"]
     steps:
       - uses: actions/checkout@v4
       - name: Install NASM
@@ -20,24 +32,13 @@ jobs:
       - name: odin version
         run: odin version
       - name: make test
-        run: make test
-
-  integration:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Install NASM
-        run: sudo apt-get update && sudo apt-get install -y nasm
-      - name: Set up Odin
-        uses: laytan/setup-odin@v2
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-          release: nightly
+        run: make test OPT=${{ matrix.opt }}
       - name: make test-integration
-        run: make test-integration
+        run: make test-integration OPT=${{ matrix.opt }}
 
   examples:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - name: Install NASM
@@ -47,5 +48,16 @@ jobs:
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
           release: nightly
-      - name: Build examples
-        run: make examples
+      - name: odin version
+        run: odin version
+      # Building is not enough: the TLS defect produced examples that linked
+      # cleanly and then segfaulted, so CI runs them at both levels.
+      - name: Build and run examples (default)
+        run: |
+          make examples
+          for ex in hello spawn pingpong parallel chan; do
+            echo "==> run bin/$ex"
+            timeout 60 ./bin/$ex > /dev/null
+          done
+      - name: Build and run examples (-o:speed)
+        run: make examples-speed

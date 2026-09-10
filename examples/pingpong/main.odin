@@ -10,14 +10,14 @@ import bifrost "../../bifrost"
 ROUNDS :: 3
 
 ping :: proc(arg: rawptr) {
-	for i in 0 ..< ROUNDS {
+	for _ in 0 ..< ROUNDS {
 		fmt.println("ping")
 		bifrost.gosched()
 	}
 }
 
 pong :: proc(arg: rawptr) {
-	for i in 0 ..< ROUNDS {
+	for _ in 0 ..< ROUNDS {
 		fmt.println("pong")
 		bifrost.gosched()
 	}
