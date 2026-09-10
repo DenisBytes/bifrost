@@ -156,6 +156,9 @@ run :: proc() {
 		thread.destroy(mp.thread) // joins, then frees the Thread handle
 	}
 	free_worker_ms()
+	// Drop any timer still queued. See timers_drain: leaving entries behind lets
+	// a LATER run() fire them into memory the caller has since freed.
+	timers_drain()
 }
 
 // free_worker_ms releases the current worker-M generation: each M's g0 stack,

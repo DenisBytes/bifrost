@@ -200,12 +200,20 @@ time_sleep_wake :: proc(arg: rawptr) {
 // hits the "buffer unexpectedly full" panic. Receive (in a select or directly)
 // and discard the value if you don't need it.
 //
-// LIFETIME: chan_destroy AFTER the timer has fired is safe; chan_destroy
-// BEFORE the timer fires is undefined — the queued Timer.f would write into
-// freed memory (there is no timer-cancel API yet). In the typical
-// select-with-timeout flow, destroying after the select returns is safe only
-// when the timeout case was the one chosen — otherwise drain the timeout chan
-// first to ensure the callback has run. A timer-cancel API is a follow-up.
+// LIFETIME: the returned channel is heap-allocated and is NOT owned by the
+// runtime. Always cancel before freeing:
+//
+//   ch := time_after(50 * time.Millisecond)
+//   defer chan_destroy(ch)
+//   defer time_after_stop(ch)   // LIFO: runs FIRST, so cancel precedes free
+//   chosen, _ := select_(ops[:], true)
+//
+// Cancelling first is required whenever the timeout was not the case that
+// fired. A queued Timer holds the raw ^Hchan, so destroying the channel while
+// the timer is still pending leaves the callback writing into freed memory —
+// and because the allocator recycles the block immediately (in practice into
+// the next time_after's channel) the stale fire lands a tick in a LIVE channel:
+// a wrong result with no crash and no diagnostic.
 time_after :: proc(d: time.Duration) -> Chan(i64) {
 	if allp == nil {
 		panic("bifrost: call runtime_init before time_after")
@@ -215,6 +223,71 @@ time_after :: proc(d: time.Duration) -> Chan(i64) {
 	deadline := timer_deadline(d)
 	timer_push(pp, Timer{deadline = deadline, f = time_after_fire, arg = rawptr(ch.c)})
 	return ch
+}
+
+// time_after_stop cancels a pending timer created by time_after, returning true
+// if it was still queued (so it will never fire) and false if it had already
+// fired or was already stopped. Safe to call more than once, and safe on a
+// channel whose timer has fired.
+//
+// This is what makes the select-with-timeout idiom leak-free: without it, every
+// iteration in which the data case wins leaves a live Timer holding the raw
+// ^Hchan, which the caller can then neither free (use-after-free) nor abandon
+// (an unbounded leak of roughly 152 bytes per call). Mirrors (*Timer).Stop
+// (src/time/sleep.go) in role, though bifrost's timer has no reset path.
+//
+// It scans every P's heap rather than only the creating P's: the goroutine that
+// called time_after may since have been stolen to another P, and the Timer stays
+// on the P it was pushed onto. gomaxprocs is small and cancellation is not a hot
+// path, so the linear scan is cheaper than tracking ownership.
+time_after_stop :: proc(ch: Chan(i64)) -> bool {
+	if allp == nil || ch.c == nil {
+		return false
+	}
+	target := rawptr(ch.c)
+	for pp in allp {
+		sync.lock(&pp.timers_lock)
+		for i in 0 ..< len(pp.timers) {
+			if pp.timers[i].f != time_after_fire || pp.timers[i].arg != target {
+				continue
+			}
+			// Swap the last element into the hole and restore the heap. Sifting
+			// down alone is not enough: the replacement may be SMALLER than the
+			// removed entry's parent, in which case it must move up instead.
+			last := len(pp.timers) - 1
+			pp.timers[i] = pp.timers[last]
+			pop(&pp.timers)
+			if i < len(pp.timers) {
+				timer_sift_down(pp.timers[:], i)
+				timer_sift_up(pp.timers[:], i)
+			}
+			intrinsics.atomic_store(&pp.ntimers, i32(len(pp.timers)))
+			sync.unlock(&pp.timers_lock)
+			return true
+		}
+		sync.unlock(&pp.timers_lock)
+	}
+	return false
+}
+
+// timers_drain drops every pending timer on every P without firing any of them.
+// Called by run() at shutdown.
+//
+// Dropping rather than firing is correct: run() returns only once grunning has
+// hit 0, so no goroutine remains for a time_sleep timer to wake, and a
+// time_after timer's channel belongs to the caller, who is no longer inside
+// run(). Leaving them queued is what is NOT safe — the entries hold raw
+// pointers (a ^G, or a ^Hchan the caller is about to free), and a LATER run()
+// would fire them into freed memory. That was reproduced as a
+// heap-use-after-free under valgrind.
+@(private)
+timers_drain :: proc() {
+	for pp in allp {
+		sync.lock(&pp.timers_lock)
+		clear(&pp.timers)
+		intrinsics.atomic_store(&pp.ntimers, i32(0))
+		sync.unlock(&pp.timers_lock)
+	}
 }
 
 // time_after_fire is the timer callback used by time_after. It does a
@@ -264,5 +337,11 @@ time_after_fire :: proc(arg: rawptr) {
 	// dropped (a silent drop would make the missed timeout look like a deeper
 	// scheduler bug).
 	sync.unlock(&c.lock)
-	panic("time_after_fire: chan buffer unexpectedly full — did the caller send into the channel returned by time_after? It is receive-only.")
+	panic(
+		"time_after_fire: chan buffer unexpectedly full. Either the caller sent into " +
+		"the channel returned by time_after (it is receive-only), or this Hchan is not " +
+		"the one the timer was created for — i.e. the original was chan_destroy'd while " +
+		"its timer was still pending and the block has been recycled. Cancel with " +
+		"time_after_stop before destroying.",
+	)
 }
