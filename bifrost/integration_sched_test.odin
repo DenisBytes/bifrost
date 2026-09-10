@@ -274,3 +274,59 @@ test_integration_multi_m_repeated :: proc(t: ^testing.T) {
 		runtime_teardown()
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Dead-G reuse across Ps (the central sched.gfree list)
+// ---------------------------------------------------------------------------
+
+@(private = "file")
+GFREE_BATCH_SIZE :: 500
+@(private = "file")
+GFREE_ROUNDS :: 20
+@(private = "file")
+gfree_wg: WaitGroup
+
+@(private = "file")
+gfree_noop :: proc(arg: rawptr) {
+	waitgroup_done(&gfree_wg)
+}
+
+@(private = "file")
+gfree_driver :: proc(arg: rawptr) {
+	for _ in 0 ..< GFREE_ROUNDS {
+		waitgroup_add(&gfree_wg, GFREE_BATCH_SIZE)
+		for _ in 0 ..< GFREE_BATCH_SIZE {
+			go_(gfree_noop)
+		}
+		waitgroup_wait(&gfree_wg)
+	}
+}
+
+@(test)
+test_integration_gfree_reuse_multi_p :: proc(t: ^testing.T) {
+	// A goroutine usually dies on a different P than the one that created it, so
+	// without a central free-G list the creating P's gfree stays empty and newg
+	// mmaps a fresh stack per goroutine CREATION — allgs grows without bound
+	// even at fixed concurrency, until the process aborts at vm.max_map_count.
+	//
+	// Peak concurrency here is GFREE_BATCH_SIZE, so a runtime that reuses
+	// properly needs only about that many Gs no matter how many rounds run.
+	if integration_skip(t) do return
+
+	runtime_init(4)
+	defer runtime_teardown()
+
+	gfree_wg = {}
+	go_(gfree_driver)
+	run()
+
+	total := GFREE_BATCH_SIZE * GFREE_ROUNDS
+	testing.expectf(
+		t,
+		len(allgs) <= GFREE_BATCH_SIZE * 3,
+		"allgs = %d after %d goroutines at peak concurrency %d; dead Gs are not being reused across Ps",
+		len(allgs),
+		total,
+		GFREE_BATCH_SIZE,
+	)
+}

@@ -259,6 +259,18 @@ Schedt :: struct {
 	// shutdown, once set (atomic), tells every M's findrunnable to return nil so
 	// the schedule loop exits.
 	shutdown: bool,
+	// gfree is the central free-G list: dead Gs (with their stacks) spilled from
+	// the per-P caches so that any P can reuse them. gfreelock guards it.
+	// Mirrors Go's sched.gFree / sched.gFlock (proc.go gfput/gfget).
+	//
+	// Without it a G that dies on a different P than created it is stranded: the
+	// creating P's local list stays empty, newg falls to the allocate path, and a
+	// program with fixed concurrency still mmaps a fresh 32 KiB stack per
+	// goroutine CREATION until it exhausts vm.max_map_count. A dedicated lock
+	// (not sched.lock) keeps G churn from contending with run-queue and idle-M
+	// operations.
+	gfree:     G_List,
+	gfreelock: sync.Mutex,
 	// sudogcache is the central free-Sudog list (LIFO via Sudog.next), a backstop
 	// shared by all Ps and refilled/spilled in batches; sudoglock guards it.
 	// Mirrors Go's sched.sudogcache / sched.sudoglock. A dedicated lock (not

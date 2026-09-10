@@ -1019,19 +1019,69 @@ globrunqget :: proc() -> ^G {
 // Dead-G free list (per P)
 // ---------------------------------------------------------------------------
 
+// GFREE_LOCAL_MAX bounds a P's local free-G list before it spills to the
+// central list; GFREE_BATCH is how many Gs move at a time. Matches Go's 64/32
+// (proc.go gfput/gfget).
+@(private)
+GFREE_LOCAL_MAX :: 64
+@(private)
+GFREE_BATCH :: 32
+
 // gfput returns a dead goroutine (with its stack) to P's free list for reuse.
-// Mirrors gfput (proc.go).
+// When the local list grows past GFREE_LOCAL_MAX it spills GFREE_BATCH Gs to
+// the central sched.gfree so other Ps can reuse them. Mirrors gfput (proc.go),
+// including the cap and the batch size.
+//
+// The central list is what makes reuse work at all above one P: a goroutine
+// usually dies on a different P than the one that created it, so a purely
+// per-P list strands dead Gs on the wrong P and the creating P allocates a
+// fresh stack every time.
 @(private)
 gfput :: proc(pp: ^P, gp: ^G) {
 	gp.schedlink = pp.gfree.head
 	pp.gfree.head = gp
 	pp.gfree.n += 1
+
+	if pp.gfree.n <= GFREE_LOCAL_MAX {
+		return
+	}
+	// Detach a batch from the head of the local list, then splice it onto the
+	// central list under gfreelock.
+	first := pp.gfree.head
+	last := first
+	moved := i32(1)
+	for moved < GFREE_BATCH && last.schedlink != nil {
+		last = last.schedlink
+		moved += 1
+	}
+	pp.gfree.head = last.schedlink
+	pp.gfree.n -= moved
+	last.schedlink = nil
+
+	sync.lock(&sched.gfreelock)
+	last.schedlink = sched.gfree.head
+	sched.gfree.head = first
+	sched.gfree.n += moved
+	sync.unlock(&sched.gfreelock)
 }
 
-// gfget takes a dead goroutine off P's free list, or returns nil. Mirrors
-// gfget (proc.go).
+// gfget takes a dead goroutine off P's free list, refilling that list from the
+// central sched.gfree when it is empty. Returns nil only when both are empty.
+// Mirrors gfget (proc.go).
 @(private)
 gfget :: proc(pp: ^P) -> ^G {
+	if pp.gfree.head == nil {
+		sync.lock(&sched.gfreelock)
+		for pp.gfree.n < GFREE_BATCH && sched.gfree.head != nil {
+			gp := sched.gfree.head
+			sched.gfree.head = gp.schedlink
+			sched.gfree.n -= 1
+			gp.schedlink = pp.gfree.head
+			pp.gfree.head = gp
+			pp.gfree.n += 1
+		}
+		sync.unlock(&sched.gfreelock)
+	}
 	gp := pp.gfree.head
 	if gp == nil {
 		return nil
