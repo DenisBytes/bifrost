@@ -140,6 +140,13 @@ Sudog :: struct {
 	success: bool,
 	// c is the channel this Sudog is blocked on. Mirrors sudog.c.
 	c: ^Hchan,
+	// ticket is the notify-list ticket for a goroutine parked in a Cond. A
+	// waiter is woken only when the list's notify cursor reaches ITS ticket, so
+	// a goroutine that arrives later can never consume a notification aimed at
+	// an earlier waiter. Mirrors sudog.ticket (runtime2.go:415) as used by
+	// notifyListWait / notifyListNotifyOne (sema.go:585 / :665). Unused by the
+	// channel and semaphore paths.
+	ticket: u32,
 }
 
 // M is an OS thread of execution. Mirrors Go's m (runtime2.go:616), reduced

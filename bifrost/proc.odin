@@ -1294,6 +1294,9 @@ acquire_sudog :: proc() -> ^Sudog {
 	// future close that misses a waiter) fails loud-and-safe — a spurious "closed"
 	// — instead of silently reporting a stale success with a wrong value.
 	s.success = false
+	// Same reasoning for the Cond notify-list ticket: release_sudog does not
+	// clear it, so reset it here rather than trusting the previous owner.
+	s.ticket = 0
 	return s
 }
 

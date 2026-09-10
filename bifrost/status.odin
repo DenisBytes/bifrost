@@ -41,6 +41,7 @@ Wait_Reason :: enum {
 	Select,               // blocked in a select on multiple channels (waitReasonSelect).
 	Select_No_Cases,      // select with no cases: blocks forever (waitReasonSelectNoCases).
 	Sema_Acquire,         // blocked on a runtime semaphore (waitReasonSemacquire).
+	Cond_Wait,            // blocked in cond_wait on a Cond (waitReasonSyncCondWait).
 	Time_Sleep,           // sleeping until a deadline (waitReasonSleep).
 }
 
