@@ -109,3 +109,82 @@ mcall_switch:
 	mov  rdi, rdx            ; arg0 = gp
 	call rsi                 ; fn(gp) -- must not return
 	ud2
+
+; ---------------------------------------------------------------------------
+; Test support
+; ---------------------------------------------------------------------------
+
+global callee_saved_switch_probe
+
+; uint64 callee_saved_switch_probe(Gobuf *self /*rdi*/, Gobuf *other /*rsi*/)
+;
+; Loads a distinct sentinel into rbx and r12-r15, suspends via
+; gosave_switch(self, other), and once something resumes `self` returns a bitmask
+; of the registers that did NOT survive: bit0=rbx, bit1=r12, bit2=r13, bit3=r14,
+; bit4=r15. 0 means the round trip preserved all five.
+;
+; WHY THIS IS IN ASSEMBLY, AND WHY IT SWITCHES DIRECTLY: the property under test
+; is that gogo's pops are the exact reverse of gosave_switch/mcall_switch's
+; pushes. An Odin callback cannot test it — the compiler emits its own
+; save/restore of every callee-saved register it touches, so the callback's
+; epilogue silently repairs a mismatched restore before the caller ever sees it.
+; (Measured: with gogo's r12/r13 pops deliberately swapped, a probe that called
+; an Odin function which yielded still reported all registers intact.) The
+; sentinels must therefore be live in the registers across the switch with no
+; intervening frame, which means the switch has to happen here.
+callee_saved_switch_probe:
+	push rbp
+	mov  rbp, rsp
+	push rbx
+	push r12
+	push r13
+	push r14
+	push r15
+	sub  rsp, 24             ; scratch + realign: rsp is now 16-byte aligned
+	mov  [rbp - 48], rdi     ; self
+	mov  [rbp - 56], rsi     ; other
+
+	mov  rbx, 0x1111111111111111
+	mov  r12, 0x2222222222222222
+	mov  r13, 0x3333333333333333
+	mov  r14, 0x4444444444444444
+	mov  r15, 0x5555555555555555
+
+	mov  rdi, [rbp - 48]
+	mov  rsi, [rbp - 56]
+	call gosave_switch       ; suspend; returns when someone resumes `self`
+
+	xor  rax, rax
+	mov  rcx, 0x1111111111111111
+	cmp  rbx, rcx
+	je   .c12
+	or   rax, 1
+.c12:
+	mov  rcx, 0x2222222222222222
+	cmp  r12, rcx
+	je   .c13
+	or   rax, 2
+.c13:
+	mov  rcx, 0x3333333333333333
+	cmp  r13, rcx
+	je   .c14
+	or   rax, 4
+.c14:
+	mov  rcx, 0x4444444444444444
+	cmp  r14, rcx
+	je   .c15
+	or   rax, 8
+.c15:
+	mov  rcx, 0x5555555555555555
+	cmp  r15, rcx
+	je   .cdone
+	or   rax, 16
+.cdone:
+	add  rsp, 24
+	pop  r15
+	pop  r14
+	pop  r13
+	pop  r12
+	pop  rbx
+	pop  rbp
+	ret

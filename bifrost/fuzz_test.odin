@@ -129,3 +129,102 @@ test_fuzz_perturbation_is_active :: proc(t: ^testing.T) {
 	}
 	testing.expect(t, any_differs, "no fuzz seed produced a different order than FIFO — perturbation may be silently inactive")
 }
+
+// ---------------------------------------------------------------------------
+// Coverage: does the fuzzer actually perturb the primitives?
+// ---------------------------------------------------------------------------
+
+@(private = "file")
+FUZZ_WAITERS :: 32
+@(private = "file")
+fuzz_mu: Mutex
+@(private = "file")
+fuzz_cv: Cond
+@(private = "file")
+fuzz_gate: bool
+@(private = "file")
+fuzz_woken: int
+@(private = "file")
+fuzz_observed: u64
+
+@(private = "file")
+fuzz_waiter :: proc(arg: rawptr) {
+	mutex_lock(&fuzz_mu)
+	for !fuzz_gate {
+		cond_wait(&fuzz_cv, &fuzz_mu)
+	}
+	fuzz_woken += 1
+	mutex_unlock(&fuzz_mu)
+}
+
+@(private = "file")
+fuzz_opener :: proc(arg: rawptr) {
+	// Let every waiter park first, then release them all at once. A broadcast
+	// goreadys FUZZ_WAITERS goroutines back to back, so the global run queue
+	// genuinely holds many runnable Gs and the scheduler has a real choice to
+	// perturb — which a two-goroutine ping-pong never offers, because with at
+	// most one runnable goroutine there is nothing to reorder.
+	for _ in 0 ..< FUZZ_WAITERS * 4 {
+		gosched()
+	}
+	mutex_lock(&fuzz_mu)
+	fuzz_gate = true
+	mutex_unlock(&fuzz_mu)
+	cond_broadcast(&fuzz_cv)
+}
+
+@(private = "file")
+fuzz_run_broadcast_workload :: proc(seed: u64) {
+	runtime_init(1)
+	runtime_set_fuzz_seed(seed)
+	fuzz_gate = false
+	fuzz_woken = 0
+	mutex_init(&fuzz_mu)
+	cond_init(&fuzz_cv)
+	for _ in 0 ..< FUZZ_WAITERS {
+		go_(fuzz_waiter)
+	}
+	go_(fuzz_opener)
+	run()
+	// Capture before teardown, which resets the counter.
+	fuzz_observed = runtime_fuzz_count()
+	runtime_set_fuzz_seed(0)
+	runtime_teardown()
+}
+
+@(test)
+test_fuzz_reaches_sync_primitive_wakeups :: proc(t: ^testing.T) {
+	// The perturbation site is globrunqget, but a readied goroutine normally goes
+	// onto its P's LOCAL ring and never reaches the global queue — so before
+	// ready()'s fuzz hook the fuzzer perturbed 0% of scheduling decisions in
+	// every channel/select/Mutex/sema/Cond workload. This pins that a primitive
+	// wakeup now actually consumes seed values, i.e. that the fuzzer exercises
+	// something rather than silently doing nothing.
+	fuzz_run_broadcast_workload(0x9E3779B97F4A7C15)
+
+	testing.expectf(t, fuzz_woken == FUZZ_WAITERS, "woke %d of %d waiters", fuzz_woken, FUZZ_WAITERS)
+	testing.expectf(
+		t,
+		fuzz_observed > 0,
+		"the fuzzer reordered %d scheduling decisions: it perturbed nothing in a Cond/Mutex workload",
+		fuzz_observed,
+	)
+}
+
+@(test)
+test_fuzz_seed_sweep_is_result_stable :: proc(t: ^testing.T) {
+	// Many seeds over the same workload. Perturbing the schedule must reorder
+	// wakeups without ever changing the ANSWER; a seed that does is an
+	// ordering-dependent bug in the runtime, not in the test.
+	for i in u64(1) ..= 40 {
+		fuzz_run_broadcast_workload(i * 0x9E3779B97F4A7C15)
+		testing.expectf(
+			t,
+			fuzz_woken == FUZZ_WAITERS,
+			"seed #%d: woke %d of %d waiters",
+			i,
+			fuzz_woken,
+			FUZZ_WAITERS,
+		)
+	}
+}

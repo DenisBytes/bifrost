@@ -10,11 +10,16 @@ import "base:intrinsics"
 // of currently-runnable goroutines. Tests can then be replayed under many
 // seeds to surface ordering-dependent bugs that a FIFO scheduler would miss.
 //
-// This is the smallest useful fuzzer — perturbation lives only at the
-// globrunqget pick site, since gosched/runqputslow/global overflow all funnel
-// through that queue. Future work: shuffle local runqs (more complex because
-// they are lock-free rings), bias select wake-race ordering, inject delayed
-// goreadies. See PLAN.md Phase 13.6 / 13.6b.
+// Perturbation lives at the globrunqget pick site. On its own that reaches only
+// gosched, runqputslow and global-queue overflow — measured at 0% of scheduling
+// decisions in every channel/select/Mutex/sema workload, because those wake
+// goroutines onto a P's LOCAL ring, which never reaches the global queue. So
+// ready() (proc.odin) additionally routes wakeups through globrunqput while a
+// seed is set, which is what puts the primitives in front of the shuffle.
+//
+// Future work: shuffle the local runqs directly (harder — they are lock-free
+// rings), bias the select wake race, inject delayed goreadies. See PLAN.md
+// Phase 13.6 / 13.6b.
 //
 // USAGE:
 //   runtime_init(1)
@@ -26,8 +31,11 @@ import "base:intrinsics"
 // advances it via CAS, so multi-M is safe. The xorshift STREAM is deterministic
 // per seed, but the MAPPING (which M consumes which value) depends on OS thread
 // arrival at the CAS. So:
-//   - gomaxprocs == 1, no timers: byte-identical replay for the same seed.
-//     Pure goroutine workloads (channels, select, sema, Mutex, ...) reproduce.
+//   - gomaxprocs == 1, no timers: the same seed drives the same sequence of
+//     global-queue picks. NOT byte-identical for select: select_'s poll order
+//     comes from the unseeded per-thread fastrand (see select.odin), so a
+//     select over two simultaneously-ready cases can still choose differently
+//     between runs. Channel, sema and Mutex workloads reproduce.
 //   - With timers: replay diverges. time_sleep / time_after expire against
 //     mono_now_ns, which is NOT seeded, and PARK_TIMEOUT-driven stopm wakeups
 //     are wall-clock-paced. A goready'd-from-timer goroutine landing on the
@@ -46,11 +54,29 @@ import "base:intrinsics"
 @(private)
 fuzz_seed_state: u64
 
+// fuzz_perturbations counts how many times the fuzzer has actually REORDERED a
+// scheduling decision (globrunqget picking a non-head entry), as opposed to
+// merely being enabled. It exists because "the fuzzer is on" and "the fuzzer is
+// exercising this workload" are very different claims: the perturbation site
+// only fires when the global run queue holds more than one runnable G, so a
+// workload with at most one runnable goroutine at a time is unperturbable no
+// matter what seed is set. Tests assert on this rather than on the seed.
+@(private)
+fuzz_perturbations: u64
+
 // runtime_set_fuzz_seed enables the deterministic-schedule fuzzer with the
 // given seed. Pass 0 to disable. Must be called BEFORE run() so the runtime's
 // observable scheduling is consistent for the whole run.
 runtime_set_fuzz_seed :: proc(seed: u64) {
 	intrinsics.atomic_store(&fuzz_seed_state, seed)
+}
+
+// runtime_fuzz_count returns the number of scheduling decisions the fuzzer has
+// actually reordered since the last runtime_teardown. Zero while disabled, and
+// zero even when enabled if the workload never had two goroutines runnable at
+// once.
+runtime_fuzz_count :: proc "contextless" () -> u64 {
+	return intrinsics.atomic_load(&fuzz_perturbations)
 }
 
 // runtime_fuzz_active reports whether the fuzzer is currently enabled.

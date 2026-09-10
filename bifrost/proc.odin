@@ -902,7 +902,22 @@ ready :: proc(gp: ^G) {
 		panic("ready: goroutine is not waiting")
 	}
 	casgstatus(gp, .Waiting, .Runnable)
-	runqput(getm().p, gp, true)
+	// FUZZ HOOK. Every channel, select, sema, Mutex, RWMutex, WaitGroup, Once and
+	// Cond wakeup lands here, so this is where the fuzzer has to intervene to
+	// reach those workloads at all. The perturbation itself lives in
+	// globrunqget, which reorders the global queue under a seed — but a readied
+	// goroutine normally goes onto the LOCAL ring and never reaches that queue,
+	// which is why the fuzzer previously perturbed 0% of scheduling decisions in
+	// every primitive bifrost ships (measured). Routing wakeups through the
+	// global queue under a non-zero seed puts them in front of the shuffle.
+	//
+	// Off by default: runtime_fuzz_active() is false unless a seed was set, and
+	// then this is exactly runqput's behaviour.
+	if runtime_fuzz_active() {
+		globrunqput(gp)
+	} else {
+		runqput(getm().p, gp, true)
+	}
 	wakep() // an idle M may pick up the readied goroutine
 }
 
@@ -1176,6 +1191,13 @@ globrunqget :: proc() -> ^G {
 			}
 			sched.runq.n -= 1
 			curr.schedlink = nil
+			if idx != 0 {
+				// Count only a genuine reorder. idx == 0 picks the head, which is
+				// exactly what the FIFO path would have done, so counting it would
+				// overstate how much of the schedule the fuzzer is actually
+				// exploring. See fuzz_perturbations.
+				intrinsics.atomic_add(&fuzz_perturbations, 1)
+			}
 			return curr
 		}
 	}
@@ -1509,4 +1531,5 @@ runtime_teardown :: proc() {
 	// Fuzzer state is a process-level global; reset it so a test that enables
 	// fuzz mode cannot silently leak that into the next test.
 	intrinsics.atomic_store(&fuzz_seed_state, u64(0))
+	intrinsics.atomic_store(&fuzz_perturbations, u64(0))
 }

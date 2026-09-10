@@ -32,6 +32,17 @@ when ODIN_ARCH == .amd64 {
 		// The building block of mcall (proc.odin). Mirrors Go's mcall
 		// (asm_amd64.s:425).
 		mcall_switch :: proc "c" (save: ^Gobuf, fn: rawptr, gp: ^G, g0_sp: uintptr) ---
+
+		// callee_saved_switch_probe loads a sentinel into rbx and r12-r15,
+		// suspends via gosave_switch(self, other), and once `self` is resumed
+		// returns a bitmask of the registers that did not survive (bit0=rbx,
+		// bit1=r12, bit2=r13, bit3=r14, bit4=r15; 0 == all preserved).
+		//
+		// Test support for the one property nothing else can check: that gogo's
+		// pops are the exact reverse of gosave_switch/mcall_switch's pushes. It
+		// has to switch from assembly, because an Odin frame in between emits its
+		// own save/restore and would repair a mismatch before the caller saw it.
+		callee_saved_switch_probe :: proc "c" (self: ^Gobuf, other: ^Gobuf) -> u64 ---
 	}
 
 	// CTX_SAVED_REGS is the number of callee-saved registers gosave_switch
