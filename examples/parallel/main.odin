@@ -20,6 +20,10 @@ worker :: proc(arg: rawptr) {
 
 main :: proc() {
 	bifrost.runtime_init(4)
+	// bifrost has no GC: runtime_teardown is what releases the goroutine
+	// stacks, the G/M/P structures and the sudog pool. Pair it with every
+	// runtime_init.
+	defer bifrost.runtime_teardown()
 
 	for _ in 0 ..< N {
 		bifrost.go_(worker)

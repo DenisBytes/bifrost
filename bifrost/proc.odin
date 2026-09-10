@@ -109,6 +109,10 @@ go_ :: proc(fn: proc(arg: rawptr), arg: rawptr = nil) {
 // goroutine has finished. Call runtime_init first, then go_ to spawn work, then
 // run. It spins up gomaxprocs-1 worker Ms (one per P beyond P0), runs m0's own
 // schedule loop on P0, and on shutdown joins the workers before returning.
+//
+// run may be called repeatedly against a single runtime_init: each call creates
+// a fresh worker-M generation and releases it before returning. Pair the final
+// run with runtime_teardown to free the rest of the runtime.
 run :: proc() {
 	// Unconditional, not an assert: -disable-assert strips asserts and this
 	// would then nil-deref allp inside scheduler_start instead of naming the
@@ -117,6 +121,17 @@ run :: proc() {
 		panic("bifrost: call runtime_init before run")
 	}
 	scheduler_start()
+
+	// Nothing to run. This early return is load-bearing, not an optimisation:
+	// run terminates only via begin_shutdown, which is reached only from goexit0
+	// when sched.grunning transitions 1 -> 0. Entered with grunning already 0 no
+	// goexit0 ever runs, sched.shutdown is never set, and every M spins in the
+	// PARK_TIMEOUT stopm/findrunnable poll forever — a permanent hang burning
+	// gomaxprocs threads, reachable from `runtime_init(n); run()` and from a job
+	// loop whose batch happens to be empty.
+	if intrinsics.atomic_load(&sched.grunning) == 0 {
+		return
+	}
 
 	// Spin up one worker M per P beyond P0; each runs schedule() on its own
 	// thread until shutdown.
@@ -133,9 +148,31 @@ run :: proc() {
 	gosave_switch(&m0.sched_return, &g0.sched)
 
 	// Shutdown: every worker's schedule loop has (or will) observe sched.shutdown
-	// and exit its thread. Join + free them.
+	// and exit its thread. Join them, then release the whole generation — run
+	// reassigns allms on its next call, so anything left here would become
+	// unreachable even to runtime_teardown, which walks only the current allms.
 	for mp in allms {
 		thread.destroy(mp.thread) // joins, then frees the Thread handle
+	}
+	free_worker_ms()
+}
+
+// free_worker_ms releases the current worker-M generation: each M's g0 stack,
+// its g0 G, the M itself, and the allms backing. A nil allms is a no-op, so it
+// is safe to call before any run and twice in a row.
+//
+// The OS threads must already have been joined (thread.destroy) before this is
+// called — it frees the stacks those threads were running on.
+@(private)
+free_worker_ms :: proc() {
+	for mp in allms {
+		stack_free(mp.g0_stack)
+		free(mp.g0, runtime_allocator)
+		free(mp, runtime_allocator)
+	}
+	if allms != nil {
+		delete(allms, runtime_allocator)
+		allms = nil
 	}
 }
 
@@ -281,11 +318,15 @@ goexit0 :: proc "c" (gp: ^G) {
 // Scheduler core (runs on g0)
 // ---------------------------------------------------------------------------
 
-// scheduler_start allocates the g0 scheduling stack (once) and marks P0
-// running. Called from every run(); the g0 stack is allocated only on the
-// first call and reused thereafter, so repeated run()/idle cycles within one
-// runtime_init don't leak mmap regions (matches Go: the g0 stack lives for the
-// M's lifetime, not per scheduler entry).
+// scheduler_start allocates m0's g0 scheduling stack (once) and marks P0
+// running. Called from every run(); m0's g0 stack is allocated only on the
+// first call and reused thereafter (matches Go: the g0 stack lives for the M's
+// lifetime, not per scheduler entry).
+//
+// SCOPE OF THAT CLAIM: it covers m0's g0 stack only. The WORKER Ms are created
+// fresh by newm on every run(), each with its own g0 stack, so the no-leak
+// property across repeated run() cycles is not this proc's doing — it is run()
+// releasing the previous generation via free_worker_ms.
 @(private)
 scheduler_start :: proc() {
 	if m0.g0_stack.lo == 0 {
@@ -1311,10 +1352,15 @@ sudog_pool_free :: proc() {
 // Teardown (minimal; a fuller per-test harness arrives in Phase 13.2)
 // ---------------------------------------------------------------------------
 
-// runtime_teardown frees everything runtime_init / run allocated and resets the
-// global runtime state, so tests can boot a fresh runtime. Safe to call even if
-// some pieces were never allocated.
-@(private)
+// runtime_teardown frees everything runtime_init and run allocated and resets
+// the global runtime state. Safe to call even if some pieces were never
+// allocated, and safe to call twice.
+//
+// This is part of the PUBLIC API on purpose. bifrost has no GC, so without it a
+// process can never reclaim goroutine stacks (96 KiB of address space each),
+// the G/M/P structures, the allgs/allms/allp backing, the pooled Sudogs or the
+// per-P timer heaps. Call it once the final run() has returned; runtime_init
+// may then be called again for a fresh runtime.
 runtime_teardown :: proc() {
 	// Drain check FIRST, while Gs and Sudogs are still live so the diagnostic can
 	// name the stranded goroutine. A leaked sema_acquire would otherwise leave a
@@ -1344,15 +1390,10 @@ runtime_teardown :: proc() {
 	}
 	sema_table = {}
 
-	// Worker Ms: their OS threads were already joined + destroyed by run(); free
-	// each M's g0 stack, g0, and the M itself.
-	for mp in allms {
-		stack_free(mp.g0_stack)
-		free(mp.g0, runtime_allocator)
-		free(mp, runtime_allocator)
-	}
-	delete(allms, runtime_allocator)
-	allms = nil
+	// Worker Ms: their OS threads were joined by run(), which normally also
+	// released the generation. This is the belt-and-braces path for a runtime
+	// that was init'd but never run.
+	free_worker_ms()
 
 	// Free each P's timer heap BEFORE freeing Gs / channels. Timer.arg's
 	// concrete type is determined by Timer.f, so we dispatch on f to print a

@@ -236,3 +236,57 @@ test_on_goroutine_predicate :: proc(t: ^testing.T) {
 
 	testing.expect(t, !on_goroutine(), "back on g0 after run(): on_goroutine must be false")
 }
+
+@(private = "file")
+lifecycle_ran: int
+
+@(private = "file")
+lifecycle_noop :: proc(arg: rawptr) {
+	lifecycle_ran += 1
+}
+
+@(test)
+test_run_with_no_goroutines_returns :: proc(t: ^testing.T) {
+	// run terminates only via begin_shutdown, which is reached only from goexit0
+	// when grunning transitions 1 -> 0. Entered with grunning already 0, nothing
+	// ever set sched.shutdown and every M spun in the 200us stopm/findrunnable
+	// poll forever — this test hung the runner permanently before the fix.
+	runtime_init(2)
+	defer runtime_teardown()
+	run()
+	run() // and again: an empty second run must also return
+}
+
+@(test)
+test_repeated_run_releases_worker_ms :: proc(t: ^testing.T) {
+	// run reassigns the global allms and calls newm per P on every invocation.
+	// Without free_worker_ms the previous generation (an M, its g0 G and its
+	// 132 KiB mmap'd g0 stack, per P) became unreachable — even to
+	// runtime_teardown, which walks only the CURRENT allms.
+	runtime_init(4)
+	defer runtime_teardown()
+
+	lifecycle_ran = 0
+	for _ in 0 ..< 5 {
+		go_(lifecycle_noop)
+		run()
+	}
+	testing.expectf(t, lifecycle_ran == 5, "ran %d of 5 goroutines", lifecycle_ran)
+	testing.expectf(
+		t,
+		allms == nil,
+		"allms still holds %d worker Ms after run() returned; the generation leaked",
+		len(allms),
+	)
+}
+
+@(test)
+test_teardown_is_idempotent :: proc(t: ^testing.T) {
+	// runtime_teardown is public API now, so a caller may reasonably invoke it
+	// defensively. It must tolerate an init with no run, and a second call.
+	runtime_init(2)
+	runtime_teardown()
+	runtime_teardown()
+	testing.expect(t, allp == nil, "teardown must leave allp nil")
+	testing.expect(t, allms == nil, "teardown must leave allms nil")
+}
