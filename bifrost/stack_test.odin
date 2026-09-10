@@ -54,3 +54,46 @@ test_align_up :: proc(t: ^testing.T) {
 	testing.expect(t, align_up(4096, 4096) == 4096, "align_up(4096)")
 	testing.expect(t, align_up(4097, 4096) == 8192, "align_up(4097)")
 }
+
+@(test)
+test_stack_guard_is_larger_than_a_page :: proc(t: ^testing.T) {
+	// Odin emits no stack-probe prologue, so a call frame larger than the guard
+	// steps clean over it in one `sub rsp, N` and its locals land in the
+	// adjacent goroutine's usable stack (stacks are mmap'd back-to-back). The
+	// write does not fault; it surfaces later as gogo popping a corrupted saved
+	// frame. The guard must therefore be larger than any frame the toolchain
+	// emits, not one page.
+	testing.expectf(
+		t,
+		GUARD_SIZE >= 16 * PAGE_SIZE,
+		"GUARD_SIZE = %d; a single-page guard is stepped over by any frame > PAGE_SIZE",
+		GUARD_SIZE,
+	)
+
+	s, err := stack_alloc()
+	testing.expectf(t, err == .None, "stack_alloc failed: %v", err)
+	defer stack_free(s)
+
+	testing.expect(t, s.lo >= uintptr(GUARD_SIZE), "stack base sits below its own guard region")
+	testing.expectf(
+		t,
+		s.hi - s.lo >= uintptr(STACK_MIN),
+		"usable region %d smaller than STACK_MIN %d",
+		s.hi - s.lo,
+		STACK_MIN,
+	)
+}
+
+@(test)
+test_stack_free_unmaps_the_guard_region :: proc(t: ^testing.T) {
+	// stack_free steps back GUARD_SIZE from lo to find the mmap base. If that
+	// arithmetic disagrees with stack_alloc's, every goroutine stack leaks its
+	// guard region (or munmaps a neighbour). Allocating and freeing in a loop
+	// would exhaust the VMA table if they disagreed.
+	for _ in 0 ..< 64 {
+		s, err := stack_alloc()
+		testing.expectf(t, err == .None, "stack_alloc failed: %v", err)
+		testing.expect(t, s.lo - uintptr(GUARD_SIZE) < s.lo, "guard base underflowed")
+		stack_free(s)
+	}
+}
