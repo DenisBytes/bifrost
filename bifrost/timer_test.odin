@@ -70,3 +70,50 @@ test_time_sleep_multiple_short_sleepers :: proc(t: ^testing.T) {
 
 	testing.expectf(t, intrinsics.atomic_load(&ts_completed_count) == 10, "completed = %d, want 10", ts_completed_count)
 }
+
+@(test)
+test_timer_deadline_saturates :: proc(t: ^testing.T) {
+	// A near-max Duration overflowed i64 and produced a deadline in the PAST, so
+	// the timer fired immediately instead of sleeping. timer_deadline saturates.
+	now := mono_now_ns()
+	d := timer_deadline(max(time.Duration))
+	testing.expectf(t, d > now, "deadline %d must be in the future, not wrapped past now=%d", d, now)
+	testing.expectf(t, d == max(i64), "deadline = %d, want max(i64) on saturation", d)
+
+	// Ordinary durations must be unaffected.
+	short := timer_deadline(time.Millisecond)
+	testing.expectf(t, short > now, "1ms deadline %d must exceed now=%d", short, now)
+	testing.expect(t, short < max(i64), "1ms deadline must not saturate")
+}
+
+@(test)
+test_timer_ntimers_tracks_heap_length :: proc(t: ^testing.T) {
+	// timer_run_expired early-outs on this counter without taking timers_lock or
+	// reading the clock, so it must never disagree with len(pp.timers).
+	runtime_init(1)
+	defer runtime_teardown()
+	pp := allp[0]
+	testing.expectf(t, pp.ntimers == 0, "fresh P: ntimers = %d, want 0", pp.ntimers)
+
+	far := mono_now_ns() + i64(time.Hour)
+	for i in 0 ..< 5 {
+		timer_push(pp, Timer{deadline = far + i64(i), f = time_sleep_wake, arg = nil})
+		testing.expectf(
+			t,
+			int(pp.ntimers) == len(pp.timers),
+			"after push %d: ntimers = %d, len = %d",
+			i,
+			pp.ntimers,
+			len(pp.timers),
+		)
+	}
+	testing.expectf(t, pp.ntimers == 5, "ntimers = %d, want 5", pp.ntimers)
+
+	// Nothing is due, so this must early-out and leave the heap intact.
+	timer_run_expired(pp)
+	testing.expectf(t, pp.ntimers == 5, "ntimers = %d after a no-op sweep, want 5", pp.ntimers)
+
+	// Drop them so teardown's leak diagnostic stays quiet.
+	clear(&pp.timers)
+	intrinsics.atomic_store(&pp.ntimers, i32(0))
+}

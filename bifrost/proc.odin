@@ -1440,6 +1440,7 @@ runtime_teardown :: proc() {
 			}
 		}
 		delete(pp.timers)
+		intrinsics.atomic_store(&pp.ntimers, i32(0))
 	}
 
 	for gp in allgs {

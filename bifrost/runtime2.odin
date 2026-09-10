@@ -249,6 +249,13 @@ P :: struct {
 	// is a follow-up.
 	timers:      [dynamic]Timer,
 	timers_lock: sync.Mutex,
+	// ntimers is len(timers), maintained atomically so timer_run_expired can
+	// early-out on a plain load — findrunnable calls it on every scheduler pass,
+	// and both mono_now_ns (a clock_gettime syscall) and timers_lock are far too
+	// expensive to pay when the heap is empty. Mirrors the role of Go's
+	// timers.len / timers.minWhen (time.go), which findRunnable likewise consults
+	// before doing any timer work.
+	ntimers: i32,
 }
 
 // Schedt is the global scheduler state shared by all Ms. Mirrors Go's schedt
