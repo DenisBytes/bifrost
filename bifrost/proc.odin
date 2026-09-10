@@ -136,7 +136,9 @@ run :: proc() {
 
 	// Spin up one worker M per P beyond P0; each runs schedule() on its own
 	// thread until shutdown.
+	sync.lock(&runtime_alloc_lock)
 	allms = make([]^M, int(gomaxprocs - 1), runtime_allocator)
+	sync.unlock(&runtime_alloc_lock)
 	for i in 1 ..< int(gomaxprocs) {
 		allms[i - 1] = newm(allp[i])
 	}
@@ -231,11 +233,15 @@ newg :: proc(fn: proc(arg: rawptr), arg: rawptr) -> ^G {
 
 	gp := gfget(pp) // per-P reuse: lock-free common path
 	if gp == nil {
-		// Grow path. Serialize under allgs_lock so concurrent newg from
-		// different Ms is safe even if runtime_allocator is not thread-safe (the
-		// test tracking allocator isn't), and so the allgs append is safe.
+		// Grow path. allgs_lock serializes the allgs list; runtime_alloc_lock
+		// serializes runtime_allocator itself, which is NOT guaranteed
+		// thread-safe (runtime_init takes it from the caller) and is also reached
+		// from newm and acquire_sudog under different locks. The allgs append
+		// allocates through the same allocator, so it is covered too.
 		sync.lock(&allgs_lock)
+		sync.lock(&runtime_alloc_lock)
 		gp = new(G, runtime_allocator)
+		sync.unlock(&runtime_alloc_lock)
 		s, err := stack_alloc()
 		if err != .None {
 			sync.unlock(&allgs_lock)
@@ -243,7 +249,9 @@ newg :: proc(fn: proc(arg: rawptr), arg: rawptr) -> ^G {
 		}
 		gp.stack = s
 		casgstatus(gp, .Idle, .Dead) // a zero G reads as _Gidle
+		sync.lock(&runtime_alloc_lock)
 		append(&allgs, gp)
+		sync.unlock(&runtime_alloc_lock)
 		sync.unlock(&allgs_lock)
 	}
 
@@ -354,8 +362,10 @@ scheduler_start :: proc() {
 // demand. The thread runs with a fresh default context.
 @(private)
 newm :: proc(pp: ^P) -> ^M {
+	sync.lock(&runtime_alloc_lock)
 	mp := new(M, runtime_allocator)
 	g0p := new(G, runtime_allocator)
+	sync.unlock(&runtime_alloc_lock)
 	s, err := stack_alloc(STACK_MIN * 4)
 	if err != .None {
 		panic("newm: g0 stack allocation failed")
@@ -1258,13 +1268,15 @@ acquire_sudog :: proc() -> ^Sudog {
 			pp.sudogcache[pp.sudogcache_n] = s
 			pp.sudogcache_n += 1
 		}
-		// Central list empty too: allocate. Kept under sudoglock so concurrent
-		// acquire_sudog from different Ms is safe even when runtime_allocator is
-		// not thread-safe (the test tracking allocator isn't) — mirrors newg's
-		// allocation under allgs_lock. DEVIATION from Go, which allocates outside
-		// the lock because mallocgc is thread-safe and uses acquirem for GC.
+		// Central list empty too: allocate. runtime_alloc_lock (not sudoglock) is
+		// what makes this safe against newg and newm allocating concurrently on
+		// other Ms — sudoglock only excludes other sudog operations. DEVIATION
+		// from Go, which allocates outside its lock because mallocgc is
+		// thread-safe and uses acquirem for GC.
 		if pp.sudogcache_n == 0 {
+			sync.lock(&runtime_alloc_lock)
 			pp.sudogcache[0] = new(Sudog, runtime_allocator)
+			sync.unlock(&runtime_alloc_lock)
 			pp.sudogcache_n = 1
 		}
 		sync.unlock(&sched.sudoglock)

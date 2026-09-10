@@ -324,12 +324,28 @@ sched: Schedt
 gomaxprocs: i32
 
 // runtime_allocator is the single allocator used for all runtime-owned objects
-// (G, P, M, the allp/allms/allgs backing). Captured at runtime_init so that
-// allocations made from any M's thread and the frees at teardown use one
-// consistent, thread-safe allocator. The default heap allocator is malloc-
-// backed and safe to call from multiple threads.
+// (G, P, M, the allp/allms/allgs backing). Captured at runtime_init from the
+// caller's context, so allocations made from any M's thread and the frees at
+// teardown all go through one allocator.
+//
+// It need NOT be thread-safe: every use is serialized by runtime_alloc_lock.
+// That serialization is deliberate — runtime_init takes an arbitrary
+// `allocator` parameter, so callers may reasonably pass an arena or a bump
+// allocator, and the allocation sites are spread across newg, newm,
+// acquire_sudog, run and runtime_teardown, which previously ran under two
+// DIFFERENT locks (allgs_lock and sched.sudoglock) and, in newm's case, under
+// none at all. Three disjoint critical sections meant three Ms could be inside
+// the allocator at once, while the comments at those sites each claimed their
+// own lock made it safe.
 @(private)
 runtime_allocator: runtime.Allocator
+
+// runtime_alloc_lock serializes every use of runtime_allocator.
+//
+// LOCK ORDER: innermost. It may be taken while holding allgs_lock (newg) or
+// sched.sudoglock (acquire_sudog); nothing may be taken while holding it.
+@(private)
+runtime_alloc_lock: sync.Mutex
 
 // allgs_lock guards appends to and scans of allgs, which are now performed from
 // multiple Ms (newg, deadlock reporting, teardown). LOCK ORDER: it is the inner
@@ -362,6 +378,16 @@ tls_m: ^M
 // processors and wires up m0/g0. It allocates allp and zeroes sched; it does
 // NOT start any OS threads. Mirrors the allp/sched setup portion of Go's
 // schedinit (proc.go:835) + procresize.
+//
+// ALLOCATOR: `allocator` is captured as runtime_allocator and used for every
+// runtime-owned object for the life of the runtime. It does NOT need to be
+// thread-safe — bifrost serializes every use behind runtime_alloc_lock — so an
+// arena or bump allocator is a valid choice. It must, however, outlive the
+// runtime, and runtime_teardown must be called before it is reset or destroyed.
+//
+// Note this allocator is NOT what goroutines allocate from: a goroutine runs
+// under runtime.default_context(), so its `context.allocator` is the malloc
+// heap. See go_.
 runtime_init :: proc(procs: i32, allocator := context.allocator) {
 	assert(procs >= 1, "runtime_init: gomaxprocs must be >= 1")
 
@@ -369,6 +395,7 @@ runtime_init :: proc(procs: i32, allocator := context.allocator) {
 	runtime_allocator = allocator
 	sched = {}
 	allgs_lock = {}
+	runtime_alloc_lock = {}
 	allgs = make([dynamic]^G, 0, 0, allocator)
 
 	allp = make([]^P, int(procs), allocator)

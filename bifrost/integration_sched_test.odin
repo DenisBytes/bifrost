@@ -1,6 +1,7 @@
 package bifrost
 
 import "base:intrinsics"
+import "core:mem"
 import "core:testing"
 
 // Heavier scheduler stress, gated on BIFROST_INTEGRATION. Single-M cooperative
@@ -329,4 +330,76 @@ test_integration_gfree_reuse_multi_p :: proc(t: ^testing.T) {
 		total,
 		GFREE_BATCH_SIZE,
 	)
+}
+
+// ---------------------------------------------------------------------------
+// runtime_allocator serialization
+// ---------------------------------------------------------------------------
+
+@(private = "file")
+arena_spawned: int
+@(private = "file")
+arena_done: int
+@(private = "file")
+arena_mu: Mutex
+@(private = "file")
+ARENA_ROOTS :: 8
+@(private = "file")
+ARENA_FANOUT :: 300
+
+@(private = "file")
+arena_leaf :: proc(arg: rawptr) {
+	// A contended Mutex drives sema_acquire -> acquire_sudog, so sudog
+	// allocation races the G allocation happening in the other roots' newg.
+	mutex_lock(&arena_mu)
+	arena_done += 1
+	mutex_unlock(&arena_mu)
+}
+
+@(private = "file")
+arena_root :: proc(arg: rawptr) {
+	// Spawn from inside a goroutine so newg runs on a worker M, concurrently
+	// with the other roots' newg and with acquire_sudog from the leaves.
+	for _ in 0 ..< ARENA_FANOUT {
+		go_(arena_leaf)
+		intrinsics.atomic_add(&arena_spawned, 1)
+	}
+}
+
+@(test)
+test_integration_non_threadsafe_allocator :: proc(t: ^testing.T) {
+	// runtime_init takes an arbitrary allocator, so a caller may reasonably pass
+	// an arena. newg, newm and acquire_sudog previously reached runtime_allocator
+	// from three DIFFERENT critical sections (allgs_lock, sched.sudoglock, and
+	// none at all), so three Ms could be inside a non-thread-safe allocator at
+	// once — while the comments at two of those sites claimed the opposite.
+	//
+	// mem.Arena is exactly such an allocator: its bump pointer is a plain
+	// non-atomic `offset += size`, so a torn update shows up as overlapping
+	// allocations and then as a wrong count or a crash.
+	//
+	// No WaitGroup here on purpose: run() already returns only once every
+	// goroutine has exited, and sharing one WaitGroup across concurrent spawners
+	// would mean Add racing Wait, which sync.WaitGroup forbids.
+	if integration_skip(t) do return
+
+	backing := make([]u8, 32 * 1024 * 1024)
+	defer delete(backing)
+	arena: mem.Arena
+	mem.arena_init(&arena, backing)
+
+	arena_spawned = 0
+	arena_done = 0
+
+	runtime_init(8, mem.arena_allocator(&arena))
+	defer runtime_teardown()
+	mutex_init(&arena_mu)
+	for _ in 0 ..< ARENA_ROOTS {
+		go_(arena_root)
+	}
+	run()
+
+	want := ARENA_ROOTS * ARENA_FANOUT
+	testing.expectf(t, arena_spawned == want, "spawned %d goroutines, want %d", arena_spawned, want)
+	testing.expectf(t, arena_done == want, "completed %d goroutines, want %d", arena_done, want)
 }
