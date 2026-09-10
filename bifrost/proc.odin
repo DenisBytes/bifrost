@@ -3,6 +3,7 @@ package bifrost
 import "base:intrinsics"
 import "base:runtime"
 import "core:fmt"
+import "core:os"
 import "core:sync"
 import "core:thread"
 import "core:time"
@@ -473,12 +474,19 @@ begin_shutdown :: proc() {
 // scheduling latency.
 @(private)
 wakep :: proc() {
+	// Post INSIDE the critical section. Posting after the unlock lets several
+	// wakers each pop a different M and then be descheduled before their post
+	// lands, so the number of outstanding permits is bounded by the thread
+	// count, not by one. Holding sched.lock across the post makes "at most one
+	// outstanding post per listing" a genuine invariant, because an M cannot
+	// re-list itself without taking this same lock. The post is a bare futex
+	// wake, so the critical section stays short.
 	sync.lock(&sched.lock)
 	mp := mget()
-	sync.unlock(&sched.lock)
 	if mp != nil {
 		sync.sema_post(&mp.park)
 	}
+	sync.unlock(&sched.lock)
 }
 
 // mput pushes mp onto the idle-M LIFO and runs the deadlock check. Caller must
@@ -598,12 +606,23 @@ checkdead :: proc() {
 		}
 	}
 	if waiting > 0 {
+		fmt.eprintfln("bifrost: all goroutines are asleep - deadlock!")
 		for gp in allgs {
 			if g_status(gp) == .Waiting {
 				fmt.eprintfln("  goroutine %d: waiting (%v)", gp.goid, gp.waitreason)
 			}
 		}
-		panic("all goroutines are asleep - deadlock!")
+		// Terminate the way Go's throw does, rather than panicking.
+		//
+		// This runs with sched.lock held by our caller (stopm) and allgs_lock
+		// held by our own defer, and an Odin panic is fatal but does NOT unwind,
+		// so neither lock would ever be released. In a standalone binary the
+		// resulting SIGILL kills the process and nobody notices — but a host that
+		// installs a SIGILL handler and survives it, which `odin test` does, then
+		// has every other M block forever on sched.lock. That turned a genuine
+		// deadlock at gomaxprocs >= 2 into an unbounded hang of the project's own
+		// test suite instead of a reported failure.
+		os.exit(2)
 	}
 	// waiting == 0: no non-dead goroutines remain (run is finishing). Not a
 	// deadlock — shutdown is in flight.

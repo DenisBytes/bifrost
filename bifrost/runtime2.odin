@@ -179,8 +179,16 @@ M :: struct {
 	// pile up the way a blind shared post would. It is a counting Sema used as a
 	// near-binary note: the only way a permit lingers is the timeout/post race in
 	// stopm (the wait times out just as a waker posts), leaving at most one stray
-	// permit, which the M's next park consumes as a harmless spurious wake. m0=={}
-	// / fresh worker Ms reset it each run, so nothing accumulates across runs.
+	// permit, which the M's next park consumes as a harmless spurious wake.
+	//
+	// The "at most one" bound holds because wakep and begin_shutdown both post
+	// while still holding sched.lock, so an M cannot be re-listed (and therefore
+	// re-posted) between mget and the post. Posting after dropping the lock —
+	// which is what wakep used to do — instead bounded outstanding permits by the
+	// number of concurrent wakers, i.e. by the thread count.
+	//
+	// m0=={} / fresh worker Ms reset it each run, so nothing accumulates across
+	// runs.
 	// DEVIATION: Go's `note` has an explicit noteclear reset; bifrost relies on
 	// the next wait consuming the stray permit instead.
 	park: sync.Sema,
