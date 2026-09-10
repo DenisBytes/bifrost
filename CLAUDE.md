@@ -138,6 +138,14 @@ Naming mirrors the user's Odin style (see `/home/denisbytes/dev/kafka-odin`):
 ## Platform / Out of Scope (for now)
 - **Linux x86_64 only.** aarch64, Darwin, and Windows come after x86_64 is
   solid.
+- **No goroutine may make a blocking syscall.** M is pinned to P for the process
+  lifetime and there is no `entersyscall`/`handoffp`, so a goroutine that blocks
+  in the kernel takes its P out of service permanently — and `checkdead` cannot
+  see it, because a futex-blocked M is never on `sched.midle`. `core:sync`,
+  `core:os` and blocking `core:net` are therefore unsafe inside `go_`. Any new
+  code path that could block in the kernel must say so at its call site. This is
+  the single most likely way a user loses a day; it is documented in README.md's
+  Limitations section and must stay there until Phase 10-11 lands.
 - Cgo, race detector on plain memory, write barriers, GC cooperation,
   generational/concurrent GC, growable (split) stacks, signals other than
   `SIGURG`. See `PLAN.md` "Out of scope" for the full list.

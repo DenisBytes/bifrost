@@ -105,11 +105,12 @@
       switch (Go's compiler spills them per ABIInternal; Odin's does not).
       `setup_context` (asm_amd64.odin) builds a fresh saved frame. Foreign
       decls + arch guard in `asm_amd64.odin`.
-- [ ] **2.4 Implement `mcall(fn: proc(^G))`.**
-      MOVED TO PHASE 4: mcall must save curg into curg.sched, switch to
-      g0's stack, and call fn(curg) there — it needs g0/current_g wiring that
-      only exists once the scheduler is built. See `proc.go` callers of mcall
-      (e.g. `goschedguarded_m`).
+- [x] **2.4 Implement `mcall(fn: proc(^G))`.** (delivered by 4.4)
+      Landed with the scheduler, as planned: mcall saves curg into curg.sched,
+      switches to g0's stack and calls fn(curg) there, which needs the
+      g0/current_g wiring only Phase 4 provides. It now also carries Go's
+      badmcall guard — calling a blocking API off a goroutine panics with a
+      diagnostic instead of executing `mov rsp, 0`.
 - [x] **2.5 Sanity test: ping-pong between two stacks.**
       `asm_amd64_test.odin`: two coroutines on two 64 KiB stacks bounce via
       `gosave_switch`, each incrementing a counter; one returns to the test via
@@ -122,8 +123,13 @@
 
 - [x] **3.1 Fixed-size stack allocator.** (`stack.odin`)
       `stack_alloc(size)`/`stack_free` via `core:sys/linux` mmap + a low-end
-      PROT_NONE guard page; 16 KiB default (`STACK_MIN`). No span cache. Tests
-      cover bounds, alignment, writability, and zero-Stack free.
+      PROT_NONE guard REGION; 32 KiB default (`STACK_MIN`, now
+      `#config(BIFROST_STACK_MIN, ...)`), g0 stacks at `STACK_MIN * 4`. The
+      guard is `GUARD_SIZE` = 64 KiB, not one page: Odin emits no stack probe,
+      so a frame larger than the guard steps clean over it into the adjacent
+      goroutine's stack without faulting. No span cache — which is why the live
+      goroutine ceiling is ~32,700 (two VMAs each). Tests cover bounds,
+      alignment, writability, zero-Stack free, and the guard size.
 - [ ] **3.2 `newg(fn, arg)`** — MOVED TO PHASE 4. newg allocates a G + stack
       and uses `setup_context` so the first `gogo` runs a trampoline that calls
       fn then exits. It is only exercisable once the scheduler exists, so it
@@ -216,8 +222,13 @@
 - [x] **5.6 Stress tests.** (`integration_sched_test.odin`)
       4-thread suite: 20k-goroutine parallel atomic counter (== expected,
       ≥2 Ms used), work-stealing test (children confined to one P spread across
-      Ms), cross-M gopark/goready, repeated init/run/teardown — all leak-clean,
-      run 20× in a loop with no race/deadlock. (Used 20k not 100k: each
+      Ms), cross-M gopark/goready, repeated init/run/teardown, run 20× in a loop
+      with no race/deadlock.
+      CORRECTION: "all leak-clean" was not true when written. Repeated `run()`
+      leaked the previous worker-M generation (an M, its g0 G and its 132 KiB
+      mmap'd g0 stack, per P), unreachable even to `runtime_teardown`, which
+      walks only the current `allms`. Fixed by `free_worker_ms`; a regression
+      test now asserts `allms == nil` after `run()` returns. (Used 20k not 100k: each
       goroutine is a distinct mmap'd stack, so 100k would hit the default
       vm.max_map_count; documented.) `examples/parallel` runs on 4 OS threads.
 
@@ -261,10 +272,14 @@
       Determine "all Ms idle" from the idle-list count while holding
       `sched.lock` (mirror `proc.go:6397` `checkdead`) so the queue-empty
       check + idle count + status scan are one consistent snapshot.
-      Distinguish a true all-`_Gwaiting` deadlock (panic with goids + wait
-      reasons) from a *lost wakeup* (runnable work exists yet all Ms idle →
-      loud, distinct error), restoring the lost-wakeup invariant the Phase-4
-      `check_dead` had and the Phase-5 rewrite dropped.
+      WHAT ACTUALLY SHIPPED (this box previously promised more): a true
+      all-`_Gwaiting` deadlock reports goids + wait reasons and exits(2) — it
+      must not panic, because it runs holding `sched.lock` and `allgs_lock` and
+      an Odin panic does not unwind. The *lost wakeup* case (runnable work
+      exists yet all Ms idle) is deliberately NOT reported: `PARK_TIMEOUT`'s
+      re-poll resolves it, so it is benign rather than fatal here. The reasoning
+      is written at `proc.odin` checkdead. That distinct diagnostic must be
+      reinstated when `PARK_TIMEOUT` is replaced by spinning Ms — see 10.4.
 - [x] **5.5.6 Comment-honesty pass (CLAUDE.md rule 2).**
       Fix stale "Phase 5 will…" caveats now that Phase 5 is done: the goexit
       temp-allocator caveat (`proc.odin:166-170`) and the `casgstatus`
@@ -373,8 +388,11 @@
 - [x] **7.6 Acceptance: timeout idiom.**
       `time_after(d) -> Chan(i64)` returns a cap-1 channel that fires the
       monotonic tick after `d` via a non-parking Timer callback (direct handoff
-      to a parked select receiver if present, else buffer write, else drop —
-      matching Go's `time.After` over-fire semantics). The callback runs on g0,
+      to a parked select receiver if present, else buffer write, else PANIC).
+      DEVIATION from `time.After`, which drops an over-fire: bifrost panics,
+      because with cap 1 and a receive-only contract the only way to reach a
+      full buffer is caller misuse or a destroy-before-cancel use-after-free,
+      and silently dropping either would disguise the bug as a missed timeout. The callback runs on g0,
       so it inlines the send logic rather than calling `chansend` (which can
       park). Tested via `select_` racing a value channel against a `time_after`:
       no sender → timeout case fires. KNOWN LIMITATION: no timer-cancel API,
@@ -491,6 +509,32 @@
       `g.sched`, switches to `g0`, calls `schedule`. See
       `signal_unix.go` `doSigPreempt` and `preempt.go`.
       *This is the most fragile task in the project.*
+- [ ] **10.4 Syscall handoff (`entersyscall`/`exitsyscall`/`handoffp`).**
+      RAISED BY THE 2026-09 PRODUCTION AUDIT, and currently the single most
+      user-visible gap. M is pinned to P for the process lifetime and
+      `releasep` has no callers, so a goroutine that blocks in the kernel takes
+      its P out of service permanently — and `checkdead` is structurally blind
+      to it, because a futex-blocked M is never on `sched.midle`. Two goroutines
+      contending on a `core:sync.Mutex` at `gomaxprocs=1` hang with no output;
+      `fmt.println` into a pipe with a slow reader does the same. Needs
+      `_Gsyscall`/`_Psyscall`, `entersyscall`/`exitsyscall`, `handoffp` and a
+      sysmon retake (10.2). Until it lands, README.md's Limitations section
+      documents the constraint.
+- [ ] **10.5 Replace `PARK_TIMEOUT` with a deadline-bounded park.**
+      An idle runtime currently burns O(gomaxprocs²) CPU re-polling every
+      200 µs — measured at 4.1 cores at `gomaxprocs=64` with zero runnable
+      work. Go instead computes `pollUntil` from the per-P timer heaps and
+      blocks until then. BLOCKED ON: `PARK_TIMEOUT` is load-bearing for the
+      lost-wakeup window bifrost deliberately leaves open (see `wakep`), so it
+      cannot be removed before spinning Ms (10.1/10.2) make the handoff
+      reliable. Doing it in the wrong order converts a latency cost into a hang.
+- [ ] **10.6 Suballocate goroutine stacks from spans.**
+      RAISED BY THE 2026-09 AUDIT. Each goroutine costs two kernel VMAs (an
+      `mmap` plus the `mprotect` that splits it), capping live goroutines at
+      ~32,700 against the default `vm.max_map_count` — after which `go_` aborts
+      the process, since it has no error return. Go serves stacks from per-P
+      span caches, so its VMA count is O(spans). Either port that, or give `go_`
+      a fallible variant.
 
 ---
 
@@ -513,9 +557,12 @@
 - [ ] **12.1 `runtime_dump()` debug helper.**
       Print all Gs, Ms, Ps and their states. Invaluable for
       debugging deadlocks.
-- [ ] **12.2 Examples folder.**
-      `examples/01_hello.odin`, `02_pingpong.odin`, `03_chan.odin`,
-      `04_select.odin`, `05_workerpool.odin`.
+- [x] **12.2 Examples folder.**
+      `examples/{hello,spawn,pingpong,parallel,chan}/main.odin`, one directory
+      each. `make examples` builds them, `make examples-speed` builds AND runs
+      them at `-o:speed`, and CI does both. They are style-gated by `make check`
+      alongside the library.
+      STILL MISSING: a `select` example.
 - [ ] **12.3 Public API docs.**
       Per-procedure doc comments linking to the Go source line that
       inspired them.
